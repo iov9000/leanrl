@@ -9,6 +9,7 @@ import random
 import time
 from collections import deque
 from dataclasses import dataclass
+from typing import Optional
 
 import gymnasium as gym
 import numpy as np
@@ -74,6 +75,12 @@ class Args:
 
     measure_burnin: int = 3
     """Number of burn-in iterations for speed measure."""
+    # Checkpointing / evaluation
+    save_dir: str = "checkpoints"
+    save_interval: int = 100000
+    eval: bool = False
+    load_path: Optional[str] = None
+    eval_episodes: int = 10
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -280,6 +287,35 @@ if __name__ == "__main__":
         update_pol = CudaGraphModule(update_pol, in_keys=[], out_keys=[])
         # policy = CudaGraphModule(policy)
 
+    # Eval-only helpers
+    def load_actor(weights_path: str):
+        state = torch.load(weights_path, map_location=device)
+        actor.load_state_dict(state)
+        actor.eval()
+
+    def evaluate_policy(n_episodes: int) -> float:
+        eval_env = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, False, run_name)])
+        ep_returns = []
+        obs, _ = eval_env.reset(seed=args.seed)
+        obs = torch.as_tensor(obs, device=device, dtype=torch.float)
+        with torch.no_grad():
+            while len(ep_returns) < n_episodes:
+                mean_action = actor.get_action(obs)[2]
+                next_obs, rewards, terminations, truncations, infos = eval_env.step(mean_action.cpu().numpy())
+                if "final_info" in infos:
+                    for info in infos["final_info"]:
+                        ep_returns.append(float(info["episode"]["r"]))
+                obs = torch.as_tensor(next_obs, device=device, dtype=torch.float)
+        eval_env.close()
+        return float(np.mean(ep_returns)) if ep_returns else 0.0
+
+    if args.eval:
+        assert args.load_path is not None and os.path.isfile(args.load_path), "Provide a valid --load_path for eval"
+        load_actor(args.load_path)
+        avg_ret = evaluate_policy(args.eval_episodes)
+        print(f"Eval average return over {args.eval_episodes} episodes: {avg_ret:.2f}")
+        raise SystemExit(0)
+
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
     obs = torch.as_tensor(obs, device=device, dtype=torch.float)
@@ -289,6 +325,7 @@ if __name__ == "__main__":
     avg_returns = deque(maxlen=20)
     desc = ""
 
+    os.makedirs(args.save_dir, exist_ok=True)
     for global_step in pbar:
         if global_step == args.measure_burnin + args.learning_starts:
             start_time = time.time()
@@ -352,6 +389,10 @@ if __name__ == "__main__":
                 # lerp is defined as x' = x + w (y-x), which is equivalent to x' = (1-w) x + w y
                 qnet_target.lerp_(qnet_params.data, args.tau)
 
+            if args.save_interval and global_step % args.save_interval == 0:
+                ckpt_path = os.path.join(args.save_dir, f"{run_name}_actor_step{global_step}.pt")
+                torch.save(actor.state_dict(), ckpt_path)
+                wandb.save(ckpt_path, policy="now")
             if global_step % 100 == 0 and start_time is not None:
                 speed = (global_step - measure_burnin) / (time.time() - start_time)
                 pbar.set_description(f"{speed: 4.4f} sps, " + desc)
@@ -371,3 +412,6 @@ if __name__ == "__main__":
                 )
 
     envs.close()
+    final_path = os.path.join(args.save_dir, f"{run_name}_actor_final.pt")
+    torch.save(actor.state_dict(), final_path)
+    wandb.save(final_path, policy="now")
