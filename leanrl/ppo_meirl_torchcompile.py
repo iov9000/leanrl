@@ -15,7 +15,7 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 from tensordict import TensorDict
-from tensordict.nn import TensorDictModule
+from tensordict.nn import TensorDictModule, CudaGraphModule
 
 from leanrl.irl.meirl import MEIRLDiscriminator
 from leanrl.irl.utils import load_hf_demos, prepare_batch_update_irl, demos_gen_dict
@@ -211,7 +211,7 @@ if __name__ == "__main__":
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = Agent(envs).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5, capturable=args.cudagraphs and not args.compile)
 
     # MEIRL Setup
     demos = load_hf_demos(args, args.n_demos)
@@ -239,6 +239,12 @@ if __name__ == "__main__":
         agent.get_value = torch.compile(agent.get_value)
         discriminator.forward = torch.compile(discriminator.forward)
         discriminator.get_reward = torch.compile(discriminator.get_reward)
+
+    if args.cudagraphs:
+        agent.get_action_and_value = CudaGraphModule(agent.get_action_and_value)
+        agent.get_value = CudaGraphModule(agent.get_value)
+        discriminator.forward = CudaGraphModule(discriminator.forward)
+        discriminator.get_reward = CudaGraphModule(discriminator.get_reward)
 
     for update in range(1, num_updates + 1):
         # Annealing the rate if instructed to do so.

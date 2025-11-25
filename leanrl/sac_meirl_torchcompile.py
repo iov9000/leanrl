@@ -40,6 +40,9 @@ class Args:
     wandb_project_name: str = "sac_meirl"
     wandb_entity: str = None
 
+    save_video: bool = False
+    save_video_length: int = 1000
+
     # Algorithm specific arguments
     env_id: str = "HalfCheetah-v4"
     total_timesteps: int = 1_000_000

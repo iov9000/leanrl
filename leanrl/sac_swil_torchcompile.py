@@ -104,6 +104,10 @@ class Args:
     on_policy: bool = False
     use_sb_ppo: bool = False
     # Checkpoint / evaluation
+    wandb_entity: str = None
+
+    save_video: bool = False
+    save_video_length: int = 1000
     save_dir: str = "checkpoints"
     save_interval: int = 100000
     eval: bool = False
