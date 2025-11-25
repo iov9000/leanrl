@@ -345,29 +345,38 @@ if __name__ == "__main__":
         actor.eval()
 
     def evaluate_policy(n_episodes: int) -> float:
-        eval_env = gym.vector.SyncVectorEnv(
-            [make_env(args.env_id, args.seed, 0, False, run_name)]
-        )
+        # Use single env instead of SyncVectorEnv to avoid potential hangs
+        eval_env = make_env(args.env_id, args.seed, 0, False, run_name)()
+        
         ep_returns = []
         obs_buf, acs_buf, rew_buf, done_buf = [], [], [], []
         obs, _ = eval_env.reset(seed=args.seed)
-        obs_t = torch.as_tensor(obs, device=device, dtype=torch.float)
+        obs_t = torch.as_tensor(obs, device=device, dtype=torch.float).unsqueeze(0)
         with torch.no_grad():
             while len(ep_returns) < n_episodes:
                 mean_action = actor.get_action(obs_t)[2]
                 next_obs, rewards, terminations, truncations, infos = eval_env.step(
-                    mean_action.cpu().numpy()
+                    mean_action.cpu().numpy()[0]
                 )
-                obs_buf.append(np.asarray(obs)[0])
+                obs_buf.append(np.asarray(obs))
                 acs_buf.append(np.asarray(mean_action.cpu().numpy())[0])
-                rew_buf.append(float(rewards[0]))
-                done_buf.append(bool(terminations[0] or truncations[0]))
-                if "final_info" in infos:
-                    for info in infos["final_info"]:
-                        if info and "episode" in info:
-                            ep_returns.append(float(info["episode"]["r"]))
+                rew_buf.append(float(rewards))
+                done_buf.append(bool(terminations or truncations))
+                
+                if terminations or truncations:
+                    if "episode" in infos:
+                        ep_returns.append(float(infos["episode"]["r"]))
+                    else:
+                        # Fallback if RecordEpisodeStatistics doesn't trigger or is different
+                        # But RecordEpisodeStatistics is used in make_env
+                        # It usually puts 'episode' in info on done
+                        pass
+                    
+                    # Reset if done
+                    next_obs, _ = eval_env.reset()
+                
                 obs = next_obs
-                obs_t = torch.as_tensor(obs, device=device, dtype=torch.float)
+                obs_t = torch.as_tensor(obs, device=device, dtype=torch.float).unsqueeze(0)
         eval_env.close()
         avg_ret = float(np.mean(ep_returns)) if ep_returns else 0.0
         if args.save_demo:
