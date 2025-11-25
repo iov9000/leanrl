@@ -102,7 +102,7 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
-        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10), env.observation_space)
         env = gym.wrappers.NormalizeReward(env, gamma=gamma)
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         return env
@@ -183,12 +183,9 @@ def rollout(obs, done, avg_returns=[]):
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, reward, next_done, infos = step_func(action)
 
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                r = float(info["episode"]["r"].reshape(()))
-                # max_ep_ret = max(max_ep_ret, r)
+        if "episode" in infos:
+            for r in infos["episode"]["r"][infos["episode"]["_r"]]:
                 avg_returns.append(r)
-            # desc = f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f})"
 
         ts.append(
             tensordict.TensorDict._new_unsafe(

@@ -393,17 +393,16 @@ if __name__ == "__main__":
                 torch.Tensor(next_done).to(device),
             )
 
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info and "episode" in info:
-                        if args.track:
-                            wandb.log(
-                                {
-                                    "charts/episodic_return": info["episode"]["r"],
-                                    "charts/episodic_length": info["episode"]["l"],
-                                },
-                                step=global_step,
-                            )
+            if "episode" in infos:
+                for r, l in zip(infos["episode"]["r"][infos["episode"]["_r"]], infos["episode"]["l"][infos["episode"]["_r"]]):
+                    if args.track:
+                        wandb.log(
+                            {
+                                "charts/episodic_return": r,
+                                "charts/episodic_length": l,
+                            },
+                            step=global_step,
+                        )
 
         # bootstrap value if not done
         with torch.no_grad():

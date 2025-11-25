@@ -449,9 +449,8 @@ if __name__ == "__main__":
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                r = float(info["episode"]["r"])
+        if "episode" in infos:
+            for r in infos["episode"]["r"][infos["episode"]["_r"]]:
                 max_ep_ret = max(max_ep_ret, r)
                 avg_returns.append(r)
             desc = f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f})"
@@ -459,15 +458,9 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         next_obs = torch.as_tensor(next_obs, device=device, dtype=torch.float)
         real_next_obs = next_obs.clone()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                final_obs = None
-                if "final_observation" in infos:
-                    final_obs = infos["final_observation"][idx]
-                elif "final_info" in infos and infos["final_info"][idx] and "final_observation" in infos["final_info"][idx]:
-                    final_obs = infos["final_info"][idx]["final_observation"]
-                
-                if final_obs is not None:
+        if "final_observation" in infos:
+            for idx, final_obs in enumerate(infos["final_observation"]):
+                if infos["_final_observation"][idx]:
                     real_next_obs[idx] = torch.as_tensor(
                         final_obs, device=device, dtype=torch.float
                     )

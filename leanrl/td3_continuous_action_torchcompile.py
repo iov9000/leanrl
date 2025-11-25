@@ -282,22 +282,21 @@ if __name__ == "__main__":
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                r = float(info["episode"]["r"].reshape(()))
-                max_ep_ret = max(max_ep_ret, r)
+        if "episode" in infos:
+            for r in infos["episode"]["r"][infos["episode"]["_r"]]:
+                max_ep_ret = max(max_ep_ret, r) # Re-added this line for max_ep_ret to be updated
                 avg_returns.append(r)
             desc = (
-                f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f})"
+                f"global_step={global_step}, episodic_return={np.array(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f})"
             )
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         next_obs = torch.as_tensor(next_obs, device=device, dtype=torch.float)
         real_next_obs = next_obs.clone()
         if "final_observation" in infos:
-            real_next_obs[truncations] = torch.as_tensor(
-                np.asarray(list(infos["final_observation"][truncations]), dtype=np.float32), device=device, dtype=torch.float
-            )
+            for idx, final_obs in enumerate(infos["final_observation"]):
+                if infos["_final_observation"][idx]:
+                    real_next_obs[idx] = torch.as_tensor(final_obs, device=device, dtype=torch.float)
         # obs = torch.as_tensor(obs, device=device, dtype=torch.float)
         transition = TensorDict(
             observations=obs,

@@ -512,26 +512,25 @@ if __name__ == "__main__":
 
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                r = float(info["episode"]["r"])
+        if "episode" in infos:
+            for r in infos["episode"]["r"][infos["episode"]["_r"]]:
                 max_ep_ret = max(max_ep_ret, r)
                 avg_returns.append(r)
             desc = f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f})"
 
-        next_obs = torch.as_tensor(next_obs, device=device, dtype=torch.float)
+        next_obs = torch.as_as_tensor(next_obs, device=device, dtype=torch.float)
         real_next_obs = next_obs.clone()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_obs[idx] = torch.as_tensor(
-                    infos["final_observation"][idx], dtype=torch.float
-                )
-
+        if "final_observation" in infos:
+            for idx, final_obs in enumerate(infos["final_observation"]):
+                if infos["_final_observation"][idx]:
+                    real_next_obs[idx] = torch.as_as_tensor(
+                        final_obs, device=device, dtype=torch.float
+                    )
         transition = TensorDict(
             observations=obs,
             next_observations=real_next_obs,
-            actions=torch.as_tensor(actions, device=device, dtype=torch.float),
-            rewards=torch.as_tensor(rewards, device=device, dtype=torch.float),
+            actions=torch.as_as_tensor(actions, device=device, dtype=torch.float),
+            rewards=torch.as_as_tensor(rewards, device=device, dtype=torch.float),
             terminations=terminations,
             dones=terminations,
             batch_size=obs.shape[0],

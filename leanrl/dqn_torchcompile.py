@@ -205,22 +205,21 @@ if __name__ == "__main__":
         next_obs, rewards, terminations, truncations, infos = envs.step(actions.cpu().numpy())
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if info and "episode" in info:
-                    avg_returns.append(info["episode"]["r"])
-            desc = f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean()}"
+        if "episode" in infos:
+            for r in infos["episode"]["r"][infos["episode"]["_r"]]:
+                avg_returns.append(r)
+            desc = f"global_step={global_step}, episodic_return={np.array(avg_returns).mean()}"
 
         next_obs = torch.as_tensor(next_obs, dtype=torch.float).to(device, non_blocking=True)
         terminations = torch.as_tensor(terminations, dtype=torch.bool).to(device, non_blocking=True)
         rewards = torch.as_tensor(rewards, dtype=torch.float).to(device, non_blocking=True)
 
         real_next_obs = None
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                if real_next_obs is None:
-                    real_next_obs = next_obs.clone()
-                real_next_obs[idx] = torch.as_tensor(infos["final_observation"][idx], device=device, dtype=torch.float)
+        if "final_observation" in infos:
+            real_next_obs = next_obs.clone()
+            for idx, final_obs in enumerate(infos["final_observation"]):
+                if infos["_final_observation"][idx]:
+                    real_next_obs[idx] = torch.as_tensor(final_obs, device=device, dtype=torch.float)
         if real_next_obs is None:
             real_next_obs = next_obs
         # obs = torch.as_tensor(obs, device=device, dtype=torch.float)
