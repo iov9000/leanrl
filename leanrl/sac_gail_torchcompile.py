@@ -1,4 +1,3 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import os
 
 os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
@@ -8,9 +7,8 @@ import os
 import random
 import time
 from collections import deque
-from dataclasses import dataclass
-from typing import Optional
-import pickle
+from dataclasses import dataclass, field
+from typing import List, Optional
 import pickle
 
 import gymnasium as gym
@@ -25,85 +23,101 @@ import wandb
 from tensordict import TensorDict, from_module, from_modules
 from tensordict.nn import CudaGraphModule, TensorDictModule
 
-# from stable_baselines3.common.buffers import ReplayBuffer
 from torchrl.data import LazyTensorStorage, ReplayBuffer
+
+from irl.gail import GAILDiscriminator, GailReward
+from irl.utils import load_hf_demos, prepare_batch_update_irl
 
 
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    """the name of this experiment"""
     seed: int = 1
-    """seed of the experiment"""
     torch_deterministic: bool = True
-    """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
-    """if toggled, cuda will be enabled by default"""
     capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
+    track: bool = False
+    wandb_project_name: str = "sac_gail"
+    wandb_entity: str = None
 
     # Algorithm specific arguments
     env_id: str = "HalfCheetah-v4"
-    """the environment id of the task"""
-    total_timesteps: int = 1000000
-    """total timesteps of the experiments"""
+    total_timesteps: int = 1_000_000
     buffer_size: int = int(1e6)
-    """the replay memory buffer size"""
     gamma: float = 0.99
-    """the discount factor gamma"""
     tau: float = 0.005
-    """target smoothing coefficient (default: 0.005)"""
     batch_size: int = 256
-    """the batch size of sample from the reply memory"""
-    learning_starts: int = 5e3
-    """timestep to start learning"""
+    learning_starts: int = 5_000
     policy_lr: float = 3e-4
-    """the learning rate of the policy network optimizer"""
     q_lr: float = 1e-3
-    """the learning rate of the Q network network optimizer"""
     policy_frequency: int = 2
-    """the frequency of training policy (delayed)"""
-    target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
-    """the frequency of updates for the target nerworks"""
+    target_network_frequency: int = 1
     alpha: float = 0.2
-    """Entropy regularization coefficient."""
     autotune: bool = True
-    """automatic tuning of the entropy coefficient"""
 
     compile: bool = False
-    """whether to use torch.compile."""
     cudagraphs: bool = False
-    """whether to use cudagraphs on top of compile."""
-
     measure_burnin: int = 3
-    """Number of burn-in iterations for speed measure."""
-    # Checkpointing / evaluation
+
+    # GAIL / IRL specific
+    demo_dir: str = "./demos"
+    n_demos: int = 10
+    subsample: int = 1
+    normalize_irl_rewards: bool = False
+    
+    # Discriminator architecture/behavior
+    use_actions: bool = True
+    use_dones: bool = False
+    use_next_obs: bool = False
+    d_layer_dims: List[int] = field(default_factory=lambda: [128, 128])
+    disc_lr: float = 3e-4
+    scheduler_gamma: float = 1.0
+    
+    use_cnn_base: bool = False
+    linear_proj: bool = False
+    proj_layer: bool = False
+    use_disc_bias: bool = False
+    use_weight_norm: bool = False
+    use_spectral_norm: bool = False
+    use_ll_weight_norm: bool = False
+    disc_nonlin: str = "tanh"  # relu/leakyrelu/prelu/tanh/id
+    irm_coeff: float = 0.0
+    lip_coeff: float = 0.0
+    lip_p: float = 1.0
+    l2_coeff: float = 0.0
+    div: str = "rkl" # fkl, rkl, js
+    # compatibility flags used by IRL utils
+    on_policy: bool = False
+    use_sb_ppo: bool = False
+    # Checkpoint / evaluation
     save_dir: str = "checkpoints"
     save_interval: int = 100000
     eval: bool = False
-    load_path: Optional[str] = None
+    load_path: str = ""
+    disc_load_path: str = ""
     eval_episodes: int = 10
     # Demo saving (eval)
     save_demo: bool = False
-    demo_dir: str = "demos"
-    demo_out: Optional[str] = None
-    # Checkpoint video capture
-    save_video: bool = False
-    save_video_length: int = 1000
-    # Demo saving (eval)
-    save_demo: bool = False
-    demo_dir: str = "demos"
-    demo_out: Optional[str] = None
+    demo_out: str = ""
 
 
-def make_env(env_id, seed, idx, capture_video, run_name):
+def make_env(args, env_id, seed, idx, capture_video, run_name, disc=None):
     def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
+        env = gym.make(
+            env_id, render_mode="rgb_array" if capture_video and idx == 0 else None
+        )
         env = gym.wrappers.RecordEpisodeStatistics(env)
+        if capture_video and idx == 0:
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        
+        if disc is not None:
+            env = GailReward(env, disc)
+            if args.normalize_irl_rewards:
+                env = gym.wrappers.NormalizeReward(env, gamma=args.gamma)
+                env = gym.wrappers.TransformReward(
+                    env, lambda r: np.clip(r, -10, 10)
+                )
+        
         env.action_space.seed(seed)
         return env
 
@@ -161,21 +175,17 @@ class Actor(nn.Module):
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
         log_std = torch.tanh(log_std)
-        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (
-            log_std + 1
-        )  # From SpinUp / Denis Yarats
-
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
         return mean, log_std
 
     def get_action(self, x):
         mean, log_std = self(x)
         std = log_std.exp()
         normal = torch.distributions.Normal(mean, std)
-        x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
+        x_t = normal.rsample()
         y_t = torch.tanh(x_t)
         action = y_t * self.action_scale + self.action_bias
         log_prob = normal.log_prob(x_t)
-        # Enforcing Action Bound
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
         log_prob = log_prob.sum(1, keepdim=True)
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
@@ -186,14 +196,15 @@ if __name__ == "__main__":
     args = tyro.cli(Args)
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{args.compile}__{args.cudagraphs}"
 
-    wandb.init(
-        project="sac_continuous_action",
-        name=f"{os.path.splitext(os.path.basename(__file__))[0]}-{run_name}",
-        config=vars(args),
-        save_code=True,
-    )
+    if args.track:
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            name=f"{os.path.splitext(os.path.basename(__file__))[0]}-{run_name}",
+            config=vars(args),
+            save_code=True,
+        )
 
-    # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -201,9 +212,34 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # env setup
+    # Load expert demos
+    demos = load_hf_demos(args, n_demos=args.n_demos)
+    demos_all = demos["all"]
+
+    # Create a single env for discriminator shape init
+    shape_env = gym.make(args.env_id)
+    disc = GAILDiscriminator(shape_env, args).to(device)
+    # Ensure discriminator optimizer supports CUDA graph capture when requested
+    disc.d_optimizer = optim.Adam(
+        disc.parameters(),
+        lr=args.disc_lr,
+        weight_decay=args.l2_coeff,
+        capturable=args.cudagraphs and not args.compile,
+    )
+
+    # env setup (vectorized with IRL reward wrapper)
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed, 0, args.capture_video, run_name)]
+        [
+            make_env(
+                args,
+                args.env_id,
+                args.seed,
+                0,
+                args.capture_video,
+                run_name,
+                disc,
+            )
+        ]
     )
     n_act = math.prod(envs.single_action_space.shape)
     n_obs = math.prod(envs.single_observation_space.shape)
@@ -211,11 +247,8 @@ if __name__ == "__main__":
         "only continuous action space is supported"
     )
 
-    max_action = float(envs.single_action_space.high[0])
-
     actor = Actor(envs, device=device, n_act=n_act, n_obs=n_obs)
     actor_detach = Actor(envs, device=device, n_act=n_act, n_obs=n_obs)
-    # Copy params to actor_detach without grad
     from_module(actor).data.to_module(actor_detach)
     policy = TensorDictModule(
         actor_detach.get_action,
@@ -228,11 +261,8 @@ if __name__ == "__main__":
         qf2 = SoftQNetwork(envs, device=device, n_act=n_act, n_obs=n_obs)
         qnet_params = from_modules(qf1, qf2, as_module=True)
         qnet_target = qnet_params.data.clone()
-
-        # discard params of net
         qnet = SoftQNetwork(envs, device="meta", n_act=n_act, n_obs=n_obs)
         qnet_params.to_module(qnet)
-
         return qnet_params, qnet_target, qnet
 
     qnet_params, qnet_target, qnet = get_q_params()
@@ -271,7 +301,6 @@ if __name__ == "__main__":
             return vals
 
     def update_main(data):
-        # optimize the model
         q_optimizer.zero_grad()
         with torch.no_grad():
             next_state_actions, next_state_log_pi, _ = actor.get_action(
@@ -313,7 +342,6 @@ if __name__ == "__main__":
             with torch.no_grad():
                 _, log_pi, _ = actor.get_action(data["observations"])
             alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
-
             alpha_loss.backward()
             a_optimizer.step()
         return TensorDict(
@@ -322,13 +350,26 @@ if __name__ == "__main__":
             alpha_loss=alpha_loss.detach(),
         )
 
-    def extend_and_sample(transition):
-        rb.extend(transition)
-        return rb.sample(args.batch_size)
+    # Discriminator update (compilable + cudagraph-eligible)
+    def update_disc(ud):
+        loss_dict = disc.compute_loss(ud)
+        total_loss = (
+            loss_dict["d_loss"]
+            + args.irm_coeff * loss_dict["grad_penalty"]
+            + args.lip_coeff * loss_dict["lip_penalty"]
+        )
+        disc.d_optimizer.zero_grad()
+        total_loss.backward()
+        disc.d_optimizer.step()
+        return TensorDict(
+            d_loss=loss_dict["d_loss"].detach(),
+            grad_penalty=torch.as_tensor(loss_dict["grad_penalty"]).detach()
+            if isinstance(loss_dict["grad_penalty"], torch.Tensor)
+            else torch.tensor(0.0, device=next(iter(disc.parameters())).device),
+        )
 
-    is_extend_compiled = False
     if args.compile:
-        mode = None  # "reduce-overhead" if not args.cudagraphs else None
+        mode = None
         update_main = torch.compile(update_main, mode=mode)
         update_pol = torch.compile(update_pol, mode=mode)
         policy = torch.compile(policy, mode=mode)
@@ -336,26 +377,41 @@ if __name__ == "__main__":
     if args.cudagraphs:
         update_main = CudaGraphModule(update_main, in_keys=[], out_keys=[])
         update_pol = CudaGraphModule(update_pol, in_keys=[], out_keys=[])
-        # policy = CudaGraphModule(policy)
+        # Do not wrap update_disc: it takes a regular argument and shapes can vary.
 
-    # Eval-only helpers
+    # Eval helpers: load and evaluate actor
     def load_actor(weights_path: str):
         state = torch.load(weights_path, map_location=device)
         actor.load_state_dict(state)
         actor.eval()
 
-    def evaluate_policy(n_episodes: int) -> float:
-        eval_env = gym.vector.SyncVectorEnv(
-            [make_env(args.env_id, args.seed, 0, False, run_name)]
+    def load_disc(weights_path: str):
+        state = torch.load(weights_path, map_location=device)
+        disc.load_state_dict(state)
+        disc.eval()
+
+    def evaluate_policy(n_episodes: int, use_swil_wrapper: bool = False) -> float:
+        base_env = gym.vector.SyncVectorEnv(
+            [
+                make_env(
+                    args,
+                    args.env_id,
+                    args.seed,
+                    0,
+                    False,
+                    run_name,
+                    disc if use_swil_wrapper else None,
+                )
+            ]
         )
         ep_returns = []
         obs_buf, acs_buf, rew_buf, done_buf = [], [], [], []
-        obs, _ = eval_env.reset(seed=args.seed)
+        obs, _ = base_env.reset(seed=args.seed)
         obs_t = torch.as_tensor(obs, device=device, dtype=torch.float)
         with torch.no_grad():
             while len(ep_returns) < n_episodes:
                 mean_action = actor.get_action(obs_t)[2]
-                next_obs, rewards, terminations, truncations, infos = eval_env.step(
+                next_obs, rewards, terminations, truncations, infos = base_env.step(
                     mean_action.cpu().numpy()
                 )
                 obs_buf.append(np.asarray(obs)[0])
@@ -367,9 +423,11 @@ if __name__ == "__main__":
                         ep_returns.append(float(info["episode"]["r"]))
                 obs = next_obs
                 obs_t = torch.as_tensor(obs, device=device, dtype=torch.float)
-        eval_env.close()
+        base_env.close()
         avg_ret = float(np.mean(ep_returns)) if ep_returns else 0.0
         if args.save_demo:
+            import os, numpy as np, pickle
+
             os.makedirs(args.demo_dir, exist_ok=True)
             out_path = (
                 args.demo_out
@@ -388,8 +446,22 @@ if __name__ == "__main__":
             demo["support_done"] = demo["done"]
             with open(out_path, "wb") as f:
                 pickle.dump(demo, f)
-            print(f"Saved demo to {out_path} (obs:{demo['obs'].shape}, acs:{demo['acs'].shape})")
+            print(
+                f"Saved demo to {out_path} (obs:{demo['obs'].shape}, acs:{demo['acs'].shape})"
+            )
         return avg_ret
+
+    if args.eval:
+        assert args.load_path and os.path.isfile(args.load_path), (
+            "Provide a valid --load_path for eval"
+        )
+        load_actor(args.load_path)
+        use_irl = bool(args.disc_load_path) and os.path.isfile(args.disc_load_path)
+        if use_irl:
+            load_disc(args.disc_load_path)
+        avg_ret = evaluate_policy(args.eval_episodes, use_swil_wrapper=use_irl)
+        print(f"Eval average return over {args.eval_episodes} episodes: {avg_ret:.2f}")
+        raise SystemExit(0)
 
     def record_checkpoint_video(step_id: int):
         if not args.save_video:
@@ -411,18 +483,9 @@ if __name__ == "__main__":
                     break
         env.close()
 
-    if args.eval:
-        assert args.load_path is not None and os.path.isfile(args.load_path), (
-            "Provide a valid --load_path for eval"
-        )
-        load_actor(args.load_path)
-        avg_ret = evaluate_policy(args.eval_episodes)
-        print(f"Eval average return over {args.eval_episodes} episodes: {avg_ret:.2f}")
-        raise SystemExit(0)
-
-    # TRY NOT TO MODIFY: start the game
+    # Main loop
     obs, _ = envs.reset(seed=args.seed)
-    obs = torch.as_tensor(obs, device=device, dtype=torch.float)
+    obs = torch.as_tensor(obs, dtype=torch.float)
     pbar = tqdm.tqdm(range(args.total_timesteps))
     start_time = None
     max_ep_ret = -float("inf")
@@ -435,19 +498,19 @@ if __name__ == "__main__":
             start_time = time.time()
             measure_burnin = global_step
 
-        # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array(
                 [envs.single_action_space.sample() for _ in range(envs.num_envs)]
             )
         else:
-            actions, _, _ = policy(obs)
-            actions = actions.cpu().numpy()
+            td_in = TensorDict(
+                {"observation": obs}, batch_size=obs.shape[0], device=device
+            )
+            td_out = policy(td_in)
+            actions = td_out["action"].detach().cpu().numpy()
 
-        # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:
                 r = float(info["episode"]["r"])
@@ -455,15 +518,14 @@ if __name__ == "__main__":
                 avg_returns.append(r)
             desc = f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f})"
 
-        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         next_obs = torch.as_tensor(next_obs, device=device, dtype=torch.float)
         real_next_obs = next_obs.clone()
         for idx, trunc in enumerate(truncations):
             if trunc:
                 real_next_obs[idx] = torch.as_tensor(
-                    infos["final_observation"][idx], device=device, dtype=torch.float
+                    infos["final_observation"][idx], dtype=torch.float
                 )
-        # obs = torch.as_tensor(obs, device=device, dtype=torch.float)
+
         transition = TensorDict(
             observations=obs,
             next_observations=real_next_obs,
@@ -475,56 +537,92 @@ if __name__ == "__main__":
             device=device,
         )
 
-        # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
-        data = extend_and_sample(transition)
+        rb.extend(transition)
 
-        # ALGO LOGIC: training.
+        # Discriminator periodic update using replay samples
         if global_step > args.learning_starts:
-            out_main = update_main(data)
-            if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
-                for _ in range(
-                    args.policy_frequency
-                ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    out_main.update(update_pol(data))
-
-                    alpha.copy_(log_alpha.detach().exp())
-
-            # update the target networks
-            if global_step % args.target_network_frequency == 0:
-                # lerp is defined as x' = x + w (y-x), which is equivalent to x' = (1-w) x + w y
-                qnet_target.lerp_(qnet_params.data, args.tau)
-
-            if args.save_interval and global_step % args.save_interval == 0:
-                ckpt_path = os.path.join(
-                    args.save_dir, f"{run_name}_actor_step{global_step}.pt"
-                )
-                torch.save(actor.state_dict(), ckpt_path)
-                wandb.save(ckpt_path, policy="now")
-            if args.save_interval and global_step % args.save_interval == 0:
-                ckpt_path = os.path.join(args.save_dir, f"{run_name}_actor_step{global_step}.pt")
-                torch.save(actor.state_dict(), ckpt_path)
-                wandb.save(ckpt_path, policy="now")
-                record_checkpoint_video(global_step)
-            if global_step % 100 == 0 and start_time is not None:
-                speed = (global_step - measure_burnin) / (time.time() - start_time)
-                pbar.set_description(f"{speed: 4.4f} sps, " + desc)
-                with torch.no_grad():
-                    logs = {
-                        "episode_return": torch.tensor(avg_returns).mean(),
-                        "actor_loss": out_main["actor_loss"].mean(),
-                        "alpha_loss": out_main.get("alpha_loss", 0),
-                        "qf_loss": out_main["qf_loss"].mean(),
-                    }
+            data_disc = rb.sample(args.batch_size)
+            ud = prepare_batch_update_irl(
+                envs,
+                args,
+                demos_all,
+                data_disc["observations"],
+                data_disc["actions"],
+                data_disc["dones"],
+                actor,
+            )
+            out_disc = update_disc(ud)
+            if global_step % 100 == 0 and args.track:
                 wandb.log(
                     {
-                        "speed": speed,
-                        **logs,
+                        "irl/d_loss": out_disc["d_loss"].mean().item(),
+                        "irl/grad_penalty": out_disc.get(
+                            "grad_penalty", torch.tensor(0.0)
+                        )
+                        .mean()
+                        .item(),
                     },
                     step=global_step,
                 )
 
+        # ALGO LOGIC: training SAC
+        if global_step > args.learning_starts:
+            data = rb.sample(args.batch_size)
+            out_main = update_main(data)
+            if global_step % args.policy_frequency == 0:
+                for _ in range(args.policy_frequency):
+                    out_main.update(update_pol(data))
+                    if args.autotune:
+                        alpha.copy_(log_alpha.detach().exp())
+
+            if global_step % args.target_network_frequency == 0:
+                qnet_target.lerp_(qnet_params.data, args.tau)
+
+            if args.save_interval and global_step % args.save_interval == 0:
+                ckpt_actor = os.path.join(
+                    args.save_dir, f"{run_name}_actor_step{global_step}.pt"
+                )
+                torch.save(actor.state_dict(), ckpt_actor)
+                if args.track:
+                    wandb.save(ckpt_actor, policy="now")
+                ckpt_disc = os.path.join(
+                    args.save_dir, f"{run_name}_disc_step{global_step}.pt"
+                )
+                torch.save(disc.state_dict(), ckpt_disc)
+                if args.track:
+                    wandb.save(ckpt_disc, policy="now")
+                record_checkpoint_video(global_step)
+            if global_step % 100 == 0 and start_time is not None:
+                speed = (global_step - measure_burnin) / (time.time() - start_time)
+                pbar.set_description(f"{speed: 4.4f} sps, " + desc)
+                if args.track:
+                    with torch.no_grad():
+                        logs = {
+                            "episode_return": torch.tensor(avg_returns).mean(),
+                            "actor_loss": out_main.get(
+                                "actor_loss", torch.tensor(0.0)
+                            ).mean(),
+                            "alpha_loss": out_main.get("alpha_loss", torch.tensor(0.0)),
+                            "qf_loss": out_main["qf_loss"].mean(),
+                        }
+                    wandb.log(
+                        {
+                            "speed": speed,
+                            **{
+                                k: (v.item() if isinstance(v, torch.Tensor) else v)
+                                for k, v in logs.items()
+                            },
+                        },
+                        step=global_step,
+                    )
+
     envs.close()
     final_path = os.path.join(args.save_dir, f"{run_name}_actor_final.pt")
     torch.save(actor.state_dict(), final_path)
-    wandb.save(final_path, policy="now")
+    if args.track:
+        wandb.save(final_path, policy="now")
+    final_disc = os.path.join(args.save_dir, f"{run_name}_disc_final.pt")
+    torch.save(disc.state_dict(), final_disc)
+    if args.track:
+        wandb.save(final_disc, policy="now")
