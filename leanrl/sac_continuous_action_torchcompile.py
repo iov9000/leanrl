@@ -364,7 +364,8 @@ if __name__ == "__main__":
                 done_buf.append(bool(terminations[0] or truncations[0]))
                 if "final_info" in infos:
                     for info in infos["final_info"]:
-                        ep_returns.append(float(info["episode"]["r"]))
+                        if info and "episode" in info:
+                            ep_returns.append(float(info["episode"]["r"]))
                 obs = next_obs
                 obs_t = torch.as_tensor(obs, device=device, dtype=torch.float)
         eval_env.close()
@@ -460,9 +461,16 @@ if __name__ == "__main__":
         real_next_obs = next_obs.clone()
         for idx, trunc in enumerate(truncations):
             if trunc:
-                real_next_obs[idx] = torch.as_tensor(
-                    infos["final_observation"][idx], device=device, dtype=torch.float
-                )
+                final_obs = None
+                if "final_observation" in infos:
+                    final_obs = infos["final_observation"][idx]
+                elif "final_info" in infos and infos["final_info"][idx] and "final_observation" in infos["final_info"][idx]:
+                    final_obs = infos["final_info"][idx]["final_observation"]
+                
+                if final_obs is not None:
+                    real_next_obs[idx] = torch.as_tensor(
+                        final_obs, device=device, dtype=torch.float
+                    )
         # obs = torch.as_tensor(obs, device=device, dtype=torch.float)
         transition = TensorDict(
             observations=obs,
@@ -525,6 +533,10 @@ if __name__ == "__main__":
                 )
 
     envs.close()
+
+    if args.save_demo:
+        evaluate_policy(args.eval_episodes)
+
     final_path = os.path.join(args.save_dir, f"{run_name}_actor_final.pt")
     torch.save(actor.state_dict(), final_path)
     wandb.save(final_path, policy="now")
