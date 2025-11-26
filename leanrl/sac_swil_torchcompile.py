@@ -102,7 +102,7 @@ class Args:
     l2_coeff: float = 0.0
     # compatibility flags used by IRL utils
     on_policy: bool = False
-    use_sb_ppo: bool = False
+
     # Checkpoint / evaluation
     wandb_entity: str = None
 

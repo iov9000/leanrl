@@ -494,10 +494,7 @@ def prepare_batch_update_irl(
     compute_lprobs=False,
     load_support=False,
 ):
-    if getattr(opt, 'use_sb_ppo', False):
-        ac_sample = env.action_space.sample()
-    else:
-        ac_sample = env.single_action_space.sample()
+    ac_sample = env.single_action_space.sample()
 
     # print(obs.shape, acs.shape, dones.shape, expert_demos['obs'].shape, expert_demos['acs'].shape, expert_demos['done'].shape)
 
@@ -574,39 +571,29 @@ def prepare_batch_update_irl(
         with torch.no_grad():
             if torch.cuda.is_available():
                 if getattr(opt, 'on_policy', False):
-                    if getattr(opt, 'use_sb_ppo', False):
-                        _, _, expert_lprobs_t = policy.policy.forward(
-                            expert_obs_t.cuda()
-                        )
-                        _, _, policy_lprobs_t = policy.policy.forward(obs_t.cuda())
-                    else:
-                        _, expert_lprobs_t, _, _ = policy.get_action_and_value(
-                            expert_obs_t.cuda(), expert_acs_t.cuda()
-                        )
-                        _, policy_lprobs_t, _, _ = policy.get_action_and_value(
-                            obs_t.cuda(), acs_t.cuda()
-                        )
+                    _, expert_lprobs_t, _, _ = policy.get_action_and_value(
+                        expert_obs_t.cuda(), expert_acs_t.cuda()
+                    )
+                    _, policy_lprobs_t, _, _ = policy.get_action_and_value(
+                        obs_t.cuda(), acs_t.cuda()
+                    )
                 else:
                     _, expert_lprobs_t, _ = policy.get_action(expert_obs_t.cuda())
                     _, policy_lprobs_t, _ = policy.get_action(obs_t.cuda())
             else:
                 if getattr(opt, 'on_policy', False):
-                    if getattr(opt, 'use_sb_ppo', False):
-                        _, _, expert_lprobs_t = policy.policy.forward(expert_obs_t)
-                        _, _, policy_lprobs_t = policy.policy.forward(obs_t)
-                    else:
-                        if not opt.use_actions:
-                            _, expert_lprobs_t, _, _ = policy.get_action_and_value(
-                                expert_obs_t
-                            )
-                        else:
-                            _, expert_lprobs_t, _, _ = policy.get_action_and_value(
-                                expert_obs_t, expert_acs_t
-                            )
-
-                        _, policy_lprobs_t, _, _ = policy.get_action_and_value(
-                            obs_t, acs_t
+                    if not opt.use_actions:
+                        _, expert_lprobs_t, _, _ = policy.get_action_and_value(
+                            expert_obs_t
                         )
+                    else:
+                        _, expert_lprobs_t, _, _ = policy.get_action_and_value(
+                            expert_obs_t, expert_acs_t
+                        )
+
+                    _, policy_lprobs_t, _, _ = policy.get_action_and_value(
+                        obs_t, acs_t
+                    )
                 else:
                     _, expert_lprobs_t, _ = policy.get_action(expert_obs_t)
                     _, policy_lprobs_t, _ = policy.get_action(obs_t)

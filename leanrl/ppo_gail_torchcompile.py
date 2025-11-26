@@ -92,7 +92,7 @@ class Args:
     div: str = "rkl" # fkl, rkl, js
     # compatibility flags used by IRL utils
     on_policy: bool = True
-    use_sb_ppo: bool = False
+
     # Checkpoint / evaluation
     save_dir: str = "checkpoints"
     save_interval: int = 100000
