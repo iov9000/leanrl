@@ -9,7 +9,6 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional
-import pickle
 
 import gymnasium as gym
 import numpy as np
@@ -58,8 +57,8 @@ class Args:
     alpha: float = 0.2
     autotune: bool = True
 
-    compile: bool = False
-    cudagraphs: bool = False
+    compile: bool = True
+    cudagraphs: bool = True
     measure_burnin: int = 3
 
     # SWIL / IRL specific
@@ -67,7 +66,7 @@ class Args:
     n_demos: int = 10
     subsample: int = 1
     normalize_irl_rewards: bool = False
-    
+
     # Discriminator architecture/behavior
     use_actions: bool = True
     use_dones: bool = False
@@ -75,7 +74,7 @@ class Args:
     d_layer_dims: List[int] = field(default_factory=lambda: [128, 128])
     disc_lr: float = 3e-4
     scheduler_gamma: float = 1.0
-    
+
     use_cnn_base: bool = False
     linear_proj: bool = False
     proj_layer: bool = False
@@ -111,15 +110,13 @@ def make_env(args, env_id, seed, idx, capture_video, run_name, disc=None):
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        
+
         if disc is not None:
             env = AirlReward(env, disc)
             if args.normalize_irl_rewards:
                 env = gym.wrappers.NormalizeReward(env, gamma=args.gamma)
-                env = gym.wrappers.TransformReward(
-                    env, lambda r: np.clip(r, -10, 10)
-                )
-        
+                env = gym.wrappers.TransformReward(env, lambda r: np.clip(r, -10, 10))
+
         env.action_space.seed(seed)
         return env
 
@@ -355,10 +352,7 @@ if __name__ == "__main__":
     # Discriminator update (compilable + cudagraph-eligible)
     def update_disc(ud):
         loss_dict = disc.compute_loss(ud)
-        total_loss = (
-            loss_dict["d_loss"]
-            + args.irm_coeff * loss_dict["grad_penalty"]
-        )
+        total_loss = loss_dict["d_loss"] + args.irm_coeff * loss_dict["grad_penalty"]
         disc.d_optimizer.zero_grad()
         total_loss.backward()
         disc.d_optimizer.step()
@@ -518,19 +512,19 @@ if __name__ == "__main__":
                 avg_returns.append(r)
             desc = f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f})"
 
-        next_obs = torch.as_as_tensor(next_obs, device=device, dtype=torch.float)
+        next_obs = torch.as_tensor(next_obs, device=device, dtype=torch.float)
         real_next_obs = next_obs.clone()
         if "final_observation" in infos:
             for idx, final_obs in enumerate(infos["final_observation"]):
                 if infos["_final_observation"][idx]:
-                    real_next_obs[idx] = torch.as_as_tensor(
+                    real_next_obs[idx] = torch.as_tensor(
                         final_obs, device=device, dtype=torch.float
                     )
         transition = TensorDict(
             observations=obs,
             next_observations=real_next_obs,
-            actions=torch.as_as_tensor(actions, device=device, dtype=torch.float),
-            rewards=torch.as_as_tensor(rewards, device=device, dtype=torch.float),
+            actions=torch.as_tensor(actions, device=device, dtype=torch.float),
+            rewards=torch.as_tensor(rewards, device=device, dtype=torch.float),
             terminations=terminations,
             dones=terminations,
             batch_size=obs.shape[0],

@@ -9,7 +9,6 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import List
-import pickle
 
 import gymnasium as gym
 import numpy as np
@@ -26,7 +25,7 @@ from tensordict.nn import CudaGraphModule, TensorDictModule
 from torchrl.data import LazyTensorStorage, ReplayBuffer
 
 from irl.swil import SWILDiscriminator, SwilReward, SwilRewardNew
-from irl.utils import load_hf_demos, prepare_batch_update_irl
+from irl.utils import load_hf_demos, prepare_batch_update_irl, demos_gen_dict
 
 
 @dataclass
@@ -74,24 +73,28 @@ class Args:
     swil_reward_type: str = "linear"
     radon_df_type: str = "poly"
     sw_poly_deg: int = 2
-    n_proj: int = 10
+    max_gsw: bool = False
+    n_proj: int = 1
     swil_loss: str = "surr_loss"  # surr_loss/approx_sw/atom_gsw
-    swil_rew: str = "old_swil"  # old_swil/replacement_nn/insertion_loss
+    swil_rew: str = "repl_loss"  # old_swil/replacement_nn/insertion_loss
+    repl_loss_type: str = "diff"  # diff/diffmax0/diff2/diff2max0/diff3
     swil_vb: int = 0
     swil_ae: bool = False
-    vb_coeff: float = 1e-4
+    vb_coeff: float = 0.0
     i_c: float = 0.1
     min_beta: float = 1.0
     max_q_len: int = 1
     max_swil_step: int = 100_000_000
     replace_atoms: bool = False
     replace_atoms_ouo: bool = False
+    aligned_index: bool = False
+    atom_weight: str = "1/n"
     shuffle_atom_batches: bool = False
     add_proj_noise: bool = False
     use_cnn_base: bool = False
     linear_proj: bool = False
     proj_layer: bool = False
-    use_disc_bias: bool = False
+    use_disc_bias: bool = True
     use_weight_norm: bool = False
     use_spectral_norm: bool = False
     use_ll_weight_norm: bool = False
@@ -100,8 +103,16 @@ class Args:
     lip_coeff: float = 0.0
     lip_p: float = 1.0
     l2_coeff: float = 0.0
+    irl_epochs: int = 1
+    irl_init_epochs: int = 1
     # compatibility flags used by IRL utils
     on_policy: bool = False
+    # New buffer-based SWIL implementation switch and options
+    swil_impl: str = "old"  # 'old' (discriminator) or 'new' (buffer-based SR/DUAL/RPL)
+    swil_variant: str = "SR"  # SR | DUAL | RPL (only for swil_impl='new')
+    swil_agg: str = "mean"  # mean | softmax | max
+    swil_tau: float = 0.5
+    swil_qgrid: int = 1024
 
     # Checkpoint / evaluation
     wandb_entity: str = None
@@ -118,12 +129,6 @@ class Args:
     save_demo: bool = False
     demo_dir: str = "demos"
     demo_out: str = ""
-    # New buffer-based SWIL implementation switch and options
-    swil_impl: str = "old"  # 'old' (discriminator) or 'new' (buffer-based SR/DUAL/RPL)
-    swil_variant: str = "SR"  # SR | DUAL | RPL (only for swil_impl='new')
-    swil_agg: str = "mean"  # mean | softmax | max
-    swil_tau: float = 0.5
-    swil_qgrid: int = 1024
 
 
 def make_env(args, env_id, seed, idx, capture_video, run_name, disc=None, demos=None):
@@ -149,6 +154,7 @@ def make_env(args, env_id, seed, idx, capture_video, run_name, disc=None, demos=
                 env = gym.wrappers.NormalizeReward(env, gamma=args.gamma)
                 env = gym.wrappers.TransformReward(env, lambda r: np.clip(r, -10, 10))
         env.action_space.seed(seed)
+        env.observation_space.seed(seed)
         return env
 
     return thunk
@@ -224,11 +230,42 @@ class Actor(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{args.compile}__{args.cudagraphs}"
+
+    # Create timestamp
+    from datetime import datetime
+    import dataclasses
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Track non-default args: where CLI values differ from dataclass defaults
+    default_args = Args()
+    non_default = {}
+    for field in dataclasses.fields(Args):
+        current_val = getattr(args, field.name)
+        default_val = getattr(default_args, field.name)
+        if current_val != default_val:
+            non_default[field.name] = current_val
+
+    # Format non-default args into string (similar to cleanrl)
+    non_default_str = (
+        str(non_default)
+        .replace(" ", "")
+        .replace(":", "")
+        .replace("{", "")
+        .replace("}", "")
+        .replace("'", "_")
+        .replace(",", "_")
+    )
+
+    run_name = (
+        f"{ts}__{args.exp_name}__{args.env_id}__seed{args.seed}__{non_default_str}"
+    )
+    if len(run_name) > 220:
+        run_name = run_name[:220]
 
     wandb.init(
         project="sac_swil",
-        name=f"{os.path.splitext(os.path.basename(__file__))[0]}-{run_name}",
+        name=run_name,
         config=vars(args),
         save_code=True,
     )
@@ -385,7 +422,7 @@ if __name__ == "__main__":
         total_loss = (
             loss_dict["d_loss"]
             + args.irm_coeff * loss_dict["grad_penalty"]
-            + disc.beta * loss_dict["ib_loss"]
+            + args.vb_coeff * loss_dict["ib_loss"]
         )
         disc.d_optimizer.zero_grad()
         if args.swil_loss != "approx_sw":
@@ -516,27 +553,7 @@ if __name__ == "__main__":
                     break
         env.close()
 
-    # Seed IRL: take a short random rollout and warm up discriminator projections
     obs, _ = envs.reset(seed=args.seed)
-    if args.n_proj == 1:
-        b_obs, b_acs, b_dones = [], [], []
-        for _ in range(min(args.batch_size, 64)):
-            rand_actions = np.array(
-                [envs.single_action_space.sample() for _ in range(envs.num_envs)]
-            )
-            next_obs, _, terminations, truncations, _ = envs.step(rand_actions)
-            dones = terminations | truncations
-            b_obs.append(torch.tensor(next_obs, dtype=torch.get_default_dtype()))
-            b_acs.append(torch.tensor(rand_actions, dtype=torch.get_default_dtype()))
-            b_dones.append(torch.tensor(dones, dtype=torch.get_default_dtype()))
-        if b_obs:
-            b_obs = torch.stack(b_obs)
-            b_acs = torch.stack(b_acs)
-            b_dones = torch.stack(b_dones)
-            ud_warm = prepare_batch_update_irl(
-                envs, args, demos_all, b_obs, b_acs, b_dones, actor
-            )
-            _ = update_disc(ud_warm)
 
     # Main loop
     obs = torch.as_tensor(obs, dtype=torch.float)
@@ -544,10 +561,13 @@ if __name__ == "__main__":
     start_time = None
     max_ep_ret = -float("inf")
     avg_returns = deque(maxlen=20)
-    desc = ""
+    init_disc_training = True  # Flag for initial discriminator training
 
     os.makedirs(args.save_dir, exist_ok=True)
     for global_step in pbar:
+        irl_trigger = False
+
+        # measure time after burn-in
         if global_step == args.measure_burnin + args.learning_starts:
             start_time = time.time()
             measure_burnin = global_step
@@ -566,6 +586,7 @@ if __name__ == "__main__":
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         if "episode" in infos:
+            irl_trigger = True  # Trigger discriminator update on episode completion
             for r in infos["episode"]["r"][infos["episode"]["_r"]]:
                 max_ep_ret = max(max_ep_ret, r)
                 avg_returns.append(r)
@@ -586,42 +607,13 @@ if __name__ == "__main__":
             actions=torch.as_tensor(actions, device=device, dtype=torch.float),
             rewards=torch.as_tensor(rewards, device=device, dtype=torch.float),
             terminations=terminations,
-            dones=terminations,
+            dones=terminations or truncations,
             batch_size=obs.shape[0],
             device=device,
         )
 
         obs = next_obs
         rb.extend(transition)
-
-        # Discriminator periodic update using replay samples
-        if global_step > args.learning_starts and (global_step % args.swil_period == 0):
-            data_disc = rb.sample(args.batch_size)
-            ud = prepare_batch_update_irl(
-                envs,
-                args,
-                demos_all,
-                data_disc["observations"],
-                data_disc["actions"],
-                data_disc["dones"],
-                actor,
-            )
-            out_disc = update_disc(ud)
-            if global_step % 100 == 0:
-                wandb.log(
-                    {
-                        "irl/d_loss": out_disc["d_loss"].mean().item(),
-                        "irl/ib_loss": out_disc.get("ib_loss", torch.tensor(0.0))
-                        .mean()
-                        .item(),
-                        "irl/grad_penalty": out_disc.get(
-                            "grad_penalty", torch.tensor(0.0)
-                        )
-                        .mean()
-                        .item(),
-                    },
-                    step=global_step,
-                )
 
         # ALGO LOGIC: training SAC
         if global_step > args.learning_starts:
@@ -635,6 +627,64 @@ if __name__ == "__main__":
 
             if global_step % args.target_network_frequency == 0:
                 qnet_target.lerp_(qnet_params.data, args.tau)
+
+            # Discriminator update using the SAME data batch that SAC just trained on
+            # Determine when to update discriminator
+            irl_condition = global_step % args.swil_period == 0
+            if args.swil_period == -1:
+                # When swil_period is -1, trigger on episode completion
+                irl_condition = irl_trigger
+
+            if irl_condition and global_step < args.max_swil_step:
+                # Use irl_init_epochs initially, then irl_epochs
+                if init_disc_training:
+                    n_irl_epochs = args.irl_init_epochs
+                else:
+                    n_irl_epochs = args.irl_epochs
+                init_disc_training = False  # Only use init_epochs once
+                for _ in range(n_irl_epochs):
+                    gen_demos = demos_gen_dict(
+                        demos_all, args.batch_size, shuffle=args.shuffle_atom_batches
+                    )
+
+                    for d in gen_demos:
+                        if len(d["obs"]) < args.batch_size:
+                            # Slice the data to match demo batch size
+                            obs_ = data["observations"][: len(d["obs"])]
+                            actions_ = data["actions"][: len(d["obs"])]
+                            dones_ = data["dones"][: len(d["obs"])]
+                        else:
+                            # Use full data batch
+                            obs_ = data["observations"]
+                            actions_ = data["actions"]
+                            dones_ = data["dones"]
+
+                        ud = prepare_batch_update_irl(
+                            envs,
+                            args,
+                            d,
+                            obs_,
+                            actions_,
+                            dones_,
+                            actor,
+                        )
+                        out_disc = update_disc(ud)
+
+                if global_step % 100 == 0:
+                    wandb.log(
+                        {
+                            "irl/d_loss": out_disc["d_loss"].mean().item(),
+                            "irl/ib_loss": out_disc.get("ib_loss", torch.tensor(0.0))
+                            .mean()
+                            .item(),
+                            "irl/grad_penalty": out_disc.get(
+                                "grad_penalty", torch.tensor(0.0)
+                            )
+                            .mean()
+                            .item(),
+                        },
+                        step=global_step,
+                    )
 
             if args.save_interval and global_step % args.save_interval == 0:
                 ckpt_actor = os.path.join(

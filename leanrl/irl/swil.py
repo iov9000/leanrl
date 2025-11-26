@@ -6,18 +6,15 @@ import torch.nn.functional as F
 import torch.autograd as autograd
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ExponentialLR
-import time
 import copy
 
 from collections import deque
 from sklearn.utils import shuffle
 
 from torch.nn.utils import spectral_norm, weight_norm
-from irl.utils import ResNetAIRLDisc, MiniGridCNN, AtariCNNBase, gaussian_kld
-from irl.gsw_utils import gsw, get_slice
+from irl.utils import MiniGridCNN, AtariCNNBase, gaussian_kld
+from irl.gsw_utils import gsw
 from tqdm import tqdm
-
-import ot
 
 
 def get_random_projections(
@@ -392,14 +389,10 @@ class SWILDiscriminator(nn.Module):
         return gsw_dist
 
     def proj(self, ob, ac, nob=None, d=None, noise=False):
-        # Avoid reinitializing network weights during forward passes.
-        # Reinitializing here modifies parameters in-place and breaks autograd.
-        # If randomized projections are needed, sample via data-dependent ops, not by
-        # changing module weights mid-graph.
-        # if self.opt.n_proj > 1 and not self.opt.linear_proj:
-        #     with torch.no_grad():
-        #         self.base.apply(layer_init)
-        #         self.reward.apply(layer_init)
+        if self.opt.n_proj > 1 and not self.opt.linear_proj:
+            with torch.no_grad():
+                self.base.apply(layer_init)
+                self.reward.apply(layer_init)
 
         base_out = self.base_fwd(self.base, ob, ac, nob, d)
 
@@ -497,7 +490,7 @@ class SWILDiscriminator(nn.Module):
 
             obs_t_slice = self.reward(vb_out).unsqueeze(0)
 
-            rew = torch.zeros(1)
+            rew = torch.zeros(1, device=obs_t_slice.device)
 
             for p, (sorted_proj, sorted_proj_tgt) in enumerate(
                 zip(self.pi_atoms_sorted, self.exp_atoms_sorted)
@@ -514,7 +507,11 @@ class SWILDiscriminator(nn.Module):
                     # idx = torch.searchsorted(sorted_proj.T.contiguous(), obs_t_slice.T.contiguous())#, right=True)
                     # determine slice index in previously sorted atoms used for SWD computation
                     if self.opt.aligned_index:
-                        idx = torch.tensor(step).unsqueeze(0).unsqueeze(0)
+                        idx = (
+                            torch.tensor(step, device=obs_t_slice.device)
+                            .unsqueeze(0)
+                            .unsqueeze(0)
+                        )
                     else:
                         idx = torch.searchsorted(
                             sorted_proj.T, obs_t_slice.T
@@ -1352,7 +1349,6 @@ class SwilReward(gym.Wrapper):
         self.cnt = 0
         return obs, info
 
-    @torch.no_grad()
     def step(self, action):
         next_obs, gt_reward, term, trunc, info = self.env.step(action)
         done = term or trunc
