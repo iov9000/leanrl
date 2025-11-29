@@ -45,6 +45,10 @@ class GAILDiscriminator(nn.Module):
             nonlin = nn.ReLU()
         elif args.disc_nonlin == 'tanh':
             nonlin = nn.Tanh()
+        elif args.disc_nonlin == 'leakyrelu':
+            nonlin = nn.LeakyReLU()
+        elif args.disc_nonlin == 'silu':
+            nonlin = nn.SiLU()
         else:
             nonlin = nn.PReLU()
 
@@ -155,10 +159,17 @@ class GAILDiscriminator(nn.Module):
 
         d_out = self.discriminator(base_out)
 
-        # XXX: log D vs log(1-D)!!!!
-        # GAIL reward is typically -log(sigmoid(D)) or similar depending on formulation
-        # Here we use -log(sigmoid(D) + epsilon)
-        self.reward = - torch.log(torch.sigmoid(d_out) + 1e-8).squeeze(-1)
+        # Allow choosing reward shaping: default is -log(1 - D) (standard GAIL).
+        # Some setups used -log(D); keep a toggle for backwards compatibility.
+        use_neg_log_d = getattr(self.args, "gail_reward_neg_log_d", False)
+        if use_neg_log_d:
+            # -log D = softplus(-logits)
+            reward = F.softplus(-d_out)
+        else:
+            # -log(1 - D) = softplus(logits)
+            reward = F.softplus(d_out)
+
+        self.reward = reward.squeeze(-1)
         return self.reward
 
     def irm_penalty(self, logits, y):
@@ -176,6 +187,21 @@ class GAILDiscriminator(nn.Module):
         exp_acs = update_dict['expert_acs']
         exp_obs_next = update_dict['expert_obs_next']
         exp_dones = update_dict['expert_dones']
+
+        # Handle mismatched batch sizes by subsampling the larger batch
+        min_bs = min(policy_obs.shape[0], exp_obs.shape[0])
+        if policy_obs.shape[0] != min_bs:
+            idx = torch.randperm(policy_obs.shape[0], device=policy_obs.device)[:min_bs]
+            policy_obs = policy_obs[idx]
+            policy_acs = policy_acs[idx]
+            policy_obs_next = policy_obs_next[idx]
+            policy_dones = policy_dones[idx]
+        if exp_obs.shape[0] != min_bs:
+            idx = torch.randperm(exp_obs.shape[0], device=exp_obs.device)[:min_bs]
+            exp_obs = exp_obs[idx]
+            exp_acs = exp_acs[idx]
+            exp_obs_next = exp_obs_next[idx]
+            exp_dones = exp_dones[idx]
 
         if len(exp_obs.shape) != len(exp_dones.shape):
             exp_dones = torch.unsqueeze(exp_dones, -1)
@@ -207,13 +233,19 @@ class GAILDiscriminator(nn.Module):
 
         estimate = self.forward(*input_)
 
-        gradient_mix = torch.autograd.grad(estimate.sum(), input_, create_graph=True)[0]
+        grads = torch.autograd.grad(estimate.sum(), input_, create_graph=True)
+        # Combine gradients from all inputs before computing the penalty
+        grads_flat = [g.reshape(g.size(0), -1) for g in grads if g is not None]
+        if len(grads_flat) == 0:
+            return torch.tensor(0.0, device=estimate.device), None
 
         # Norm's gradient could be NaN at 0. Use our own safe_norm
-        safe_norm = (torch.sum(gradient_mix ** 2, dim=1) + 1e-8).sqrt()
-        # L1
+        safe_norm = (sum((g ** 2).sum(dim=1) for g in grads_flat) + 1e-8).sqrt()
+        # L1 penalty toward target Lipschitz constant p
         gradient_mag = torch.mean((safe_norm - p) ** 2)
 
+        # Return concatenated grad for logging
+        gradient_mix = torch.cat(grads_flat, dim=1)
         return gradient_mag, gradient_mix
 
     def compute_loss(self, update_dict):
@@ -238,8 +270,9 @@ class GAILDiscriminator(nn.Module):
             policy_out,
             torch.zeros(policy_out.size(), device=policy_out.device))
 
-        labels = torch.cat([torch.zeros(expert_out.size(), device=expert_out.device),
-                            torch.ones(policy_out.size(), device=policy_out.device)])
+        # labels aligned with concatenation order: expert first (1), policy second (0)
+        labels = torch.cat([torch.ones(expert_out.size(), device=expert_out.device),
+                            torch.zeros(policy_out.size(), device=policy_out.device)])
 
         self.bce_loss = F.binary_cross_entropy_with_logits(d_out, labels)
         
@@ -247,7 +280,7 @@ class GAILDiscriminator(nn.Module):
         grad_mix_norm = 0
         if self.lip_coeff > 0:
             lip_penalty, grad_mix = self.lip_penalty(update_dict, self.args.lip_p)
-            grad_mix_norm = torch.norm(grad_mix)
+            grad_mix_norm = torch.norm(grad_mix) if grad_mix is not None else torch.tensor(0.0, device=self.policy_obs.device)
 
         self.grad_penalty = 0
         grad_irm = 0

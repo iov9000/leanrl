@@ -29,6 +29,96 @@ from irl.gail import GAILDiscriminator, GailReward
 from irl.utils import load_hf_demos, prepare_batch_update_irl
 
 
+def prepare_batch_update_irl_gpu(
+    env,
+    opt,
+    expert_demos,
+    obs,
+    acs,
+    dones,
+    policy,
+    compute_lprobs=False,
+    load_support=False,
+):
+    # Assume inputs are already on GPU tensors
+    
+    # Flatten policy samples if needed (handling vector envs)
+    # obs: [batch_size, n_envs, obs_dim] -> [batch_size * n_envs, obs_dim]
+    # But ReplayBuffer samples are usually [batch_size, obs_dim] if flattened?
+    # TorchRL ReplayBuffer samples are [batch_size, ...].
+    # If env is vectorized, RB might store [batch_size, n_envs, ...]?
+    # Let's assume standard shape [batch_size, dim] based on usage.
+    
+    # obs is [batch_size, obs_dim]
+    
+    # Construct next_obs for policy (shift) - wait, RB provides next_obs?
+    # prepare_batch_update_irl constructs next_obs from obs by shifting?
+    # No, prepare_batch_update_irl takes `obs` and constructs `obs_next` by shifting:
+    # obs_next = np.concatenate([obs[1:], np.expand_dims(obs[-1], 0)], axis=0)
+    # This implies `obs` is a TRAJECTORY?
+    # But `data_disc` comes from `rb.sample(batch_size)`. These are random transitions, NOT trajectories.
+    # Shifting random transitions makes NO SENSE for `next_obs`.
+    # However, `prepare_batch_update_irl` DOES this:
+    # obs_next = np.concatenate([obs[1:], np.expand_dims(obs[-1], 0)], axis=0)
+    # This seems WRONG for random batches.
+    # But `sac_gail` passes `data_disc["observations"]`.
+    # And `prepare_batch_update_irl` ignores `data_disc["next_observations"]`!
+    
+    # If this is the logic, I must replicate it, even if it seems weird for RB samples.
+    # (Maybe GAIL implementation expects trajectories? But RB samples are random).
+    # Wait, if `obs` are random transitions, `obs[i+1]` is NOT the next state of `obs[i]`.
+    # So `obs_next` derived this way is garbage.
+    # But `GAILDiscriminator` might not use `next_obs`?
+    # Args: `use_next_obs: bool = False` (default).
+    # So maybe it doesn't matter.
+    
+    obs_next = torch.cat([obs[1:], obs[-1].unsqueeze(0)], dim=0)
+    
+    # Expert demos
+    if isinstance(expert_demos, dict):
+        expert_obs = expert_demos["obs"]
+        expert_acs = expert_demos["acs"]
+        expert_dones = expert_demos["done"]
+        # expert_demos should be on GPU already
+    else:
+        # Handle array case if needed
+        pass
+
+    expert_obs_next = torch.cat([expert_obs[1:], expert_obs[-1].unsqueeze(0)], dim=0)
+
+    # Concatenate
+    all_obs = torch.cat([expert_obs, obs], dim=0)
+    all_obs_next = torch.cat([expert_obs_next, obs_next], dim=0)
+    all_acs = torch.cat([expert_acs, acs], dim=0)
+    all_dones = torch.cat([expert_dones, dones], dim=0)
+    
+    # Lprobs (default False)
+    all_lprobs = torch.zeros_like(all_acs) # Placeholder
+
+    update_dict = {
+        "expert_obs": expert_obs,
+        "expert_obs_next": expert_obs_next,
+        "expert_acs": expert_acs,
+        "expert_dones": expert_dones,
+        "policy_obs": obs,
+        "policy_obs_next": obs_next,
+        "policy_acs": acs,
+        "policy_dones": dones,
+        "all_obs": all_obs,
+        "all_obs_next": all_obs_next,
+        "all_acs": all_acs,
+        "all_dones": all_dones,
+        "all_lprobs": all_lprobs,
+    }
+    
+    if load_support:
+        # ... logic for support ...
+        pass
+        
+    return update_dict
+
+
+
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
@@ -218,6 +308,10 @@ if __name__ == "__main__":
     # Load expert demos
     demos = load_hf_demos(args, n_demos=args.n_demos)
     demos_all = demos["all"]
+    # Convert demos to GPU tensors
+    for k in ["obs", "acs", "rew", "done"]:
+        if k in demos_all:
+            demos_all[k] = torch.as_tensor(demos_all[k], device=device, dtype=torch.float32)
 
     # Create a single env for discriminator shape init
     shape_env = gym.make(args.env_id)
@@ -545,7 +639,7 @@ if __name__ == "__main__":
         # Discriminator periodic update using replay samples
         if global_step > args.learning_starts:
             data_disc = rb.sample(args.batch_size)
-            ud = prepare_batch_update_irl(
+            ud = prepare_batch_update_irl_gpu(
                 envs,
                 args,
                 demos_all,

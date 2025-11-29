@@ -80,6 +80,7 @@ class MEIRLDiscriminator(nn.Module):
             if self.is_atari:
                 self.base = AtariCNNBase(args, env, self.use_actions)
                 self.discriminator = nn.Linear(512, 1, bias=self.bias)
+                self.phi = nn.Identity()
             else:
                 if self.use_cnn_base:
                     self.base = MiniGridCNN(self.layer_dims, self.use_actions)
@@ -150,6 +151,8 @@ class MEIRLDiscriminator(nn.Module):
         r_policy, self.phi_policy = self.forward(update_dict['policy_obs'], update_dict['policy_acs'])
         r_expert, self.phi_expert = self.forward(update_dict['expert_obs'], update_dict['expert_acs'])
 
+        # MaxEnt IRL objective: maximize expert reward and minimize log-partition (approximated by policy reward)
+        # Equivalent to minimizing (policy mean - expert mean)
         self.diff_loss = r_policy.mean() - r_expert.mean()
         
         self.grad_penalty = 0
@@ -195,7 +198,7 @@ class MeirlReward(gym.Wrapper):
             irl_reward = self.discriminator.get_reward(obs_t, acs_t).cpu().numpy()[0]
         
         self.obs = next_obs
-        return next_obs, irl_reward[0], term, trunc, info
+        return next_obs, float(irl_reward), term, trunc, info
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)

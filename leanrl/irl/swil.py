@@ -174,6 +174,8 @@ class SWILDiscriminator(nn.Module):
             nonlin = nn.LeakyReLU()
         elif opt.disc_nonlin == "prelu":
             nonlin = nn.PReLU()
+        elif opt.disc_nonlin == "silu":
+            nonlin = nn.SiLU()
         elif opt.disc_nonlin == "tanh":
             nonlin = nn.Tanh()
         elif opt.disc_nonlin == "id":
@@ -181,9 +183,6 @@ class SWILDiscriminator(nn.Module):
         else:
             nonlin = nn.PReLU()
 
-        # if opt.swil_ae:
-        # constrain the dimension if using an autoencoder
-        #    self.layer_dims[1] = 10
         if isinstance(env.observation_space, gym.spaces.Dict):
             ob_shapes = list(env.observation_space["observation"].shape)
         else:
@@ -219,8 +218,6 @@ class SWILDiscriminator(nn.Module):
                     opt.use_spectral_norm,
                 )
             else:
-                # self.base = nn.Sequential(torch.nn.Linear(self.layer_dims[0],
-                #                                          self.layer_dims[1], bias), nonlin)
                 self.base = nn.Sequential(
                     linlayer(
                         self.layer_dims[0],
@@ -240,9 +237,6 @@ class SWILDiscriminator(nn.Module):
                 if self.reward_type == "linear":
                     self.reward_layers = []
                     for i in range(2, len(self.layer_dims)):
-                        # self.reward_layers += [torch.nn.Linear(in_features=self.layer_dims[i - 1],
-                        #                                     out_features=self.layer_dims[i],
-                        #                                     bias=bias), nonlin]
                         self.reward_layers += [
                             linlayer(
                                 self.layer_dims[i - 1],
@@ -254,9 +248,6 @@ class SWILDiscriminator(nn.Module):
                             nonlin,
                         ]
 
-                    # self.reward_layers += [torch.nn.Linear(in_features=self.layer_dims[-1],
-                    #                                     out_features=self.n_proj,
-                    #                                     bias=bias)]
                     self.reward_layers += [
                         linlayer(
                             self.layer_dims[-1],
@@ -265,9 +256,7 @@ class SWILDiscriminator(nn.Module):
                             opt.use_ll_weight_norm,
                             opt.use_spectral_norm,
                         ),
-                        nonlin,
                     ]
-                    # linlayer(self.layer_dims[-1], self.n_proj, bias, opt.use_ll_weight_norm, opt.use_spectral_norm), nn.Sigmoid()]
                     self.reward = nn.Sequential(*self.reward_layers)
                 else:
                     self.reward = nn.MultiheadAttention(
@@ -275,9 +264,6 @@ class SWILDiscriminator(nn.Module):
                     )
 
             if self.opt.proj_layer:
-                # self.proj_layer = nn.Sequential(nn.Linear(in_features=self.n_proj,
-                #                                         out_features=1,
-                #                                         bias=bias), torch.nn.Tanh())
                 self.proj_layer = nn.Sequential(
                     linlayer(
                         self.opt.n_proj,
@@ -292,26 +278,6 @@ class SWILDiscriminator(nn.Module):
             if self.opt.swil_rew == "replacement_nn":
                 self.base_rew_replnn = copy.deepcopy(self.base)
                 self.rew_replnn = copy.deepcopy(self.reward)
-
-            if self.opt.swil_ae:
-                self.ae_layers = []
-                for i in reversed(range(2, len(self.layer_dims))):
-                    self.ae_layers += [
-                        torch.nn.Linear(
-                            in_features=self.opt.n_proj,
-                            out_features=self.layer_dims[i],
-                            bias=bias,
-                        ),
-                        nonlin,
-                    ]
-                self.ae_layers += [
-                    torch.nn.Linear(
-                        in_features=self.layer_dims[-1],
-                        out_features=self.layer_dims[0],
-                        bias=bias,
-                    )
-                ]
-                self.recon_net = nn.Sequential(*self.ae_layers)
 
             if torch.cuda.is_available():
                 self.base.cuda()
@@ -328,28 +294,6 @@ class SWILDiscriminator(nn.Module):
         else:
             self.gsw_module = GSW(
                 "poly", nofprojections=opt.n_proj, degree=opt.poly_degree
-            )
-
-        if self.swil_vb > 0:
-            self.encoder_z = nn.Sequential(
-                linlayer(
-                    self.layer_dims[1],
-                    self.swil_vb * 2,
-                    bias,
-                    opt.use_weight_norm,
-                    opt.use_spectral_norm,
-                ),
-                nonlin,
-            )
-            self.decoder_z = nn.Sequential(
-                linlayer(
-                    self.swil_vb,
-                    self.layer_dims[2],
-                    bias,
-                    opt.use_weight_norm,
-                    opt.use_spectral_norm,
-                ),
-                nonlin,
             )
 
         # init sorted atom queues
@@ -408,6 +352,8 @@ class SWILDiscriminator(nn.Module):
         else:
             # XXX: additional noise?
             rew = self.reward(vb_out)
+            #rew = rew / (rew.norm(dim=-1, keepdim=True) + 1e-6)
+
             # perturb with noise -> TODO: sample from stochastic (e.g. Gaussian) process?
             if self.opt.n_proj > 1:
                 rew + torch.randn_like(rew) * 0.01
@@ -495,12 +441,6 @@ class SWILDiscriminator(nn.Module):
             for p, (sorted_proj, sorted_proj_tgt) in enumerate(
                 zip(self.pi_atoms_sorted, self.exp_atoms_sorted)
             ):
-                # sorted_proj = self.pi_atoms_sorted
-                # sorted_proj_tgt = self.exp_atoms_sorted
-
-                # if sorted_proj is None:
-                #     return torch.zeros(1)
-
                 n = len(sorted_proj)
 
                 if n > 0:
@@ -522,16 +462,9 @@ class SWILDiscriminator(nn.Module):
                     idxs = self.pi_atoms_sorted_idx[p]
                     idxs_e = self.exp_atoms_sorted_idx[p]
 
-                    # print(idxs, idxs_e, idx, torch.where(idxs==idx)[0])
-
-                    ## if idx is not in sorted list, use nearest neighbours
-
-                    # if self.opt.repl_loss_type == 'diff':
-                    #    idx -= 1
                     # idx[idx==0] +=1
                     idx[idx == n] -= 1
                     # shift extreme indices
-                    # print(n)
 
                     # print("Number of atoms in buffer", n)
                     # calculate weight based on position in queue
@@ -625,9 +558,11 @@ class SWILDiscriminator(nn.Module):
                                     # if sorted_proj[i,j] > sorted_proj_tgt[i,j]:
                                     # print("api>ae")
                                     if rew_incr > rew_decr:
+                                        chosen_idx = i - 1
                                         rew += w * (a_new_h - a_h)
                                         rew_j = a_new_h - a_h
                                     else:
+                                        chosen_idx = i
                                         rew += w * (a_new_i - a_i)
                                         rew_j = a_new_i - a_i
                                         # rew += w*(a_new - a_prev)
@@ -655,7 +590,7 @@ class SWILDiscriminator(nn.Module):
 
                             # replace stored atoms in queue if we're getting closer
                             if self.opt.replace_atoms and rew_j < 0:
-                                self.pi_atoms_sorted[p][idx] = obs_t_slice
+                                self.pi_atoms_sorted[p][chosen_idx] = obs_t_slice
 
                             if self.opt.replace_atoms_ouo:
                                 # assert self.opt.swil_period == '-1.0', 'full trajectories required'
@@ -1368,19 +1303,13 @@ class SwilReward(gym.Wrapper):
         done_t = torch.tensor(done, dtype=dtype, device=device)
 
         with torch.no_grad():
-            # get discriminator reward and train on that
-            # print([p.norm(2) for p in self.discriminator.parameters()])
-            irl_reward = (
-                self.discriminator.get_reward(
-                    obs_t, acs_t, next_obs_t, done_t, self.cnt
-                )
-                .detach()
-                .cpu()
-                .numpy()
-            )
-            # irl_reward = self.discriminator.get_reward(obs_t, acs_t, next_obs_t).cpu().numpy()
+            # get discriminator reward on device to avoid CPU<->GPU transfers
+            irl_reward = self.discriminator.get_reward(
+                obs_t, acs_t, next_obs_t, done_t, self.cnt
+            ).detach()
+
         self.obs = next_obs
-        self.traj_.append(irl_reward)
+        self.traj_.append(irl_reward.item())
         # print("GT: ", gt_reward, "IRL: ", irl_reward)
         if done:
             print("episode reward gt:", np.sum(np.array(self.traj)))
@@ -1389,7 +1318,7 @@ class SwilReward(gym.Wrapper):
             self.traj = []
             self.traj_ = []
 
-        return next_obs, float(irl_reward), term, trunc, info
+        return next_obs, float(irl_reward.item()), term, trunc, info
 
 
 class SwilFlowReward(gym.Wrapper):
@@ -1431,14 +1360,16 @@ class SwilFlowReward(gym.Wrapper):
     def step(self, action):
         next_obs, gt_reward, done, info = self.env.step(action)
         info["gt_reward"] = gt_reward
+        device = next(self.gradient_model.parameters()).device
+        dtype = torch.get_default_dtype()
         if self.obs is not None:
-            obs_t = torch.tensor(self.obs, dtype=torch.get_default_dtype())
+            obs_t = torch.tensor(self.obs, dtype=dtype, device=device)
         else:
-            obs_t = torch.tensor(next_obs, dtype=torch.get_default_dtype())
+            obs_t = torch.tensor(next_obs, dtype=dtype, device=device)
 
-        acs_t = torch.tensor(action, dtype=torch.get_default_dtype())
-        next_obs_t = torch.tensor(next_obs, dtype=torch.get_default_dtype())
-        done_t = torch.tensor(done, dtype=torch.get_default_dtype())
+        acs_t = torch.tensor(action, dtype=dtype, device=device)
+        next_obs_t = torch.tensor(next_obs, dtype=dtype, device=device)
+        done_t = torch.tensor(done, dtype=dtype, device=device)
 
         if done:
             self.traj = []
@@ -1448,15 +1379,11 @@ class SwilFlowReward(gym.Wrapper):
             # print([p.norm(2) for p in self.discriminator.parameters()])
             d_obs = next_obs_t - obs_t
             # sw_grad_obs =
-            irl_reward = (
-                self.gradient_model.get_reward(obs_t, acs_t, next_obs_t, done_t)
-                .cpu()
-                .numpy()
-            )
+            irl_reward = self.gradient_model.get_reward(obs_t, acs_t, next_obs_t, done_t)
             # irl_reward = self.discriminator.get_reward(obs_t, acs_t, next_obs_t).cpu().numpy()
         self.obs = next_obs
 
-        return next_obs, irl_reward, done, info
+        return next_obs, float(irl_reward.item()), done, info
 
 
 """
@@ -1473,6 +1400,7 @@ class SwilIRDiffReward(gym.Wrapper):
         self.opt = opt
         self.sw_poly_deg = opt.sw_poly_deg
         self.radon_df_type = opt.radon_df_type
+        self.n_proj = opt.n_proj
         # TODO: makes GSW module shared across vec envs?
         self.gsw = GSW(
             ftype=self.radon_df_type,
@@ -1499,19 +1427,20 @@ class SwilIRDiffReward(gym.Wrapper):
     def step(self, action):
         next_obs, gt_reward, done, info = self.env.step(action)
         info["gt_reward"] = gt_reward
+        device = getattr(self.gsw, "device", torch.device("cpu"))
+        dtype = torch.get_default_dtype()
         if self.obs is not None:
-            obs_t = torch.tensor(self.obs, dtype=torch.get_default_dtype())
+            obs_t = torch.as_tensor(self.obs, dtype=dtype, device=device)
         else:
-            obs_t = torch.tensor(next_obs, dtype=torch.get_default_dtype())
-
-        acs_t = torch.tensor(action, dtype=torch.get_default_dtype())
-        next_obs_t = torch.tensor(next_obs, dtype=torch.get_default_dtype())
-        done_t = torch.tensor(done, dtype=torch.get_default_dtype())
+            obs_t = torch.as_tensor(next_obs, dtype=dtype, device=device)
+        acs_t = torch.as_tensor(action, dtype=dtype, device=device)
+        next_obs_t = torch.as_tensor(next_obs, dtype=dtype, device=device)
+        done_t = torch.as_tensor(done, dtype=dtype, device=device)
 
         if done:
             self.traj = []
 
-        rew = torch.tensor([0.0])
+        rew = torch.tensor([0.0], device=device, dtype=dtype)
         if self.gsw.theta is not None:
             with torch.no_grad():
                 # project next state and rank it as part of previous evaluation
@@ -1577,7 +1506,7 @@ class SwilIRDiffReward(gym.Wrapper):
             # irl_reward = self.discriminator.get_reward(obs_t, acs_t, next_obs_t).cpu().numpy()
         self.obs = next_obs
 
-        return next_obs, float(rew.detach().numpy()), done, info
+        return next_obs, float(rew.item()), done, info
 
 
 class SwilRewardNew(gym.Wrapper):
@@ -1845,14 +1774,6 @@ class SwilRewardNew(gym.Wrapper):
         info["step"] = self.cnt
         self.cnt += 1
         self.traj.append(gt_reward)
-
-        if self.obs is not None:
-            obs_t = torch.tensor(self.obs, dtype=torch.get_default_dtype())
-        else:
-            obs_t = torch.tensor(next_obs, dtype=torch.get_default_dtype())
-        acs_t = torch.tensor(action, dtype=torch.get_default_dtype())
-        next_obs_t = torch.tensor(next_obs, dtype=torch.get_default_dtype())
-        done_t = torch.tensor(done, dtype=torch.get_default_dtype())
 
         z = self._feats(obs_t, acs_t, next_obs_t, done_t)
         Znew = z @ self.dirs.t()  # [K]

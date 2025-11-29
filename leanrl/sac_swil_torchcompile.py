@@ -51,8 +51,8 @@ class Args:
     alpha: float = 0.2
     autotune: bool = True
 
-    compile: bool = False
-    cudagraphs: bool = False
+    compile: bool = True
+    cudagraphs: bool = True
     measure_burnin: int = 3
 
     # SWIL / IRL specific
@@ -77,7 +77,7 @@ class Args:
     n_proj: int = 1
     swil_loss: str = "surr_loss"  # surr_loss/approx_sw/atom_gsw
     swil_rew: str = "repl_loss"  # old_swil/replacement_nn/insertion_loss
-    repl_loss_type: str = "diff"  # diff/diffmax0/diff2/diff2max0/diff3
+    repl_loss_type: str = "diff2"  # diff/diffmax0/diff2/diff2max0/diff3
     swil_vb: int = 0
     swil_ae: bool = False
     vb_coeff: float = 0.0
@@ -105,6 +105,8 @@ class Args:
     l2_coeff: float = 0.0
     irl_epochs: int = 1
     irl_init_epochs: int = 1
+    warmup_irl: bool = False
+    drop_batch: bool = False
     # compatibility flags used by IRL utils
     on_policy: bool = False
     # New buffer-based SWIL implementation switch and options
@@ -564,6 +566,43 @@ if __name__ == "__main__":
     init_disc_training = True  # Flag for initial discriminator training
 
     os.makedirs(args.save_dir, exist_ok=True)
+
+    # Seed IRL: take a short random rollout and warm up discriminator projections
+    if args.n_proj == 1 and args.warmup_irl:
+        b_obs, b_acs, b_dones = [], [], []
+        for _ in range(args.batch_size):
+            rand_actions = np.array(
+                [envs.single_action_space.sample() for _ in range(envs.num_envs)]
+            )
+            next_obs, _, terminations, truncations, _ = envs.step(rand_actions)
+            dones = terminations | truncations
+            b_obs.append(torch.tensor(next_obs, dtype=torch.get_default_dtype()))
+            b_acs.append(torch.tensor(rand_actions, dtype=torch.get_default_dtype()))
+            b_dones.append(torch.tensor(dones, dtype=torch.get_default_dtype()))
+        
+        if b_obs:
+            b_obs = torch.stack(b_obs)
+            b_acs = torch.stack(b_acs)
+            b_dones = torch.stack(b_dones)
+            
+            gen_demos = demos_gen_dict(demos_all, args.batch_size)
+            for d in gen_demos:
+                if len(d["obs"]) < args.batch_size:
+                    if args.drop_batch:
+                        continue
+                    obs_ = b_obs[: len(d["obs"])]
+                    actions_ = b_acs[: len(d["obs"])]
+                    dones_ = b_dones[: len(d["obs"])]
+                else:
+                    obs_ = b_obs
+                    actions_ = b_acs
+                    dones_ = b_dones
+                
+                ud_warm = prepare_batch_update_irl(
+                    envs, args, d, obs_, actions_, dones_, actor
+                )
+                _ = update_disc(ud_warm)
+
     for global_step in pbar:
         irl_trigger = False
 
