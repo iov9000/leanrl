@@ -28,6 +28,8 @@ class AIRLDiscriminator(nn.Module):
         self.use_actions = getattr(args, "use_actions", True)
         self.gamma = getattr(args, "gamma", 0.99)
         self.irm_coeff = getattr(args, "irm_coeff", 0.0)
+        self.lip_coeff = getattr(args, "lip_coeff", 0.0)
+        self.lip_p = getattr(args, "lip_p", 1.0)
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() and getattr(args, "cuda", True) else "cpu"
         )
@@ -101,6 +103,66 @@ class AIRLDiscriminator(nn.Module):
         grad = autograd.grad(loss, [scale], create_graph=True)[0]
         return torch.sum(grad**2), grad
 
+    def lip_penalty(self, update_dict, p=1.0):
+        policy_obs = update_dict["policy_obs"]
+        policy_obs_next = update_dict["policy_obs_next"]
+        policy_acs = update_dict["policy_acs"]
+        policy_lprobs = update_dict["policy_lprobs"]
+
+        expert_obs = update_dict["expert_obs"]
+        expert_obs_next = update_dict["expert_obs_next"]
+        expert_acs = update_dict["expert_acs"]
+        expert_lprobs = update_dict["expert_lprobs"]
+
+        min_bs = min(policy_obs.shape[0], expert_obs.shape[0])
+
+        def subsample_group(*tensors):
+            if tensors[0].shape[0] == min_bs:
+                return tensors
+            idx = torch.randperm(tensors[0].shape[0], device=tensors[0].device)[:min_bs]
+            return tuple(t.index_select(0, idx) for t in tensors)
+
+        (
+            policy_obs,
+            policy_obs_next,
+            policy_acs,
+            policy_lprobs,
+        ) = subsample_group(policy_obs, policy_obs_next, policy_acs, policy_lprobs)
+        (
+            expert_obs,
+            expert_obs_next,
+            expert_acs,
+            expert_lprobs,
+        ) = subsample_group(expert_obs, expert_obs_next, expert_acs, expert_lprobs)
+
+        obs_eps = torch.rand_like(policy_obs)
+        ac_eps = torch.rand_like(policy_acs)
+        next_obs_eps = torch.rand_like(policy_obs_next)
+        lp_eps = torch.rand_like(policy_lprobs)
+
+        interp_obs = (obs_eps * policy_obs + (1 - obs_eps) * expert_obs).requires_grad_(True)
+        interp_acs = (ac_eps * policy_acs + (1 - ac_eps) * expert_acs).requires_grad_(True)
+        interp_next_obs = (
+            next_obs_eps * policy_obs_next + (1 - next_obs_eps) * expert_obs_next
+        ).requires_grad_(True)
+        interp_lprobs = lp_eps * policy_lprobs + (1 - lp_eps) * expert_lprobs
+
+        logits, _, _, _ = self.forward(interp_obs, interp_next_obs, interp_acs, interp_lprobs)
+        grads = torch.autograd.grad(
+            logits.sum(),
+            [interp_obs, interp_acs, interp_next_obs],
+            create_graph=True,
+        )
+
+        grads_flat = [g.reshape(g.size(0), -1) for g in grads if g is not None]
+        if not grads_flat:
+            return torch.tensor(0.0, device=logits.device), None
+
+        safe_norm = (sum((g ** 2).sum(dim=1) for g in grads_flat) + 1e-8).sqrt()
+        penalty = torch.mean((safe_norm - p) ** 2)
+        grad_mix = torch.cat(grads_flat, dim=1)
+        return penalty, grad_mix
+
     def compute_loss(self, update_dict):
         # Expert/policy batches
         expert_obs = update_dict["expert_obs"].to(self.device, non_blocking=True)
@@ -143,6 +205,10 @@ class AIRLDiscriminator(nn.Module):
         d_loss = expert_loss + policy_loss
 
         grad_penalty = torch.tensor(0.0, device=d_loss.device)
+        lip_penalty = torch.tensor(0.0, device=d_loss.device)
+        lip_grad = None
+        if getattr(self, "lip_coeff", 0.0) > 0:
+            lip_penalty, lip_grad = self.lip_penalty(update_dict, self.lip_p)
         if getattr(self, "irm_coeff", 0.0) > 0:
             logits = torch.cat([expert_logits, policy_logits], dim=0)
             labels = torch.cat([expert_labels, policy_labels], dim=0)
@@ -153,6 +219,8 @@ class AIRLDiscriminator(nn.Module):
             "grad_penalty": grad_penalty,
             "expert_bce_loss": expert_loss,
             "policy_bce_loss": policy_loss,
+            "lip_penalty": lip_penalty,
+            "lip_grad": lip_grad,
         }
 
 class AirlReward(gym.Wrapper):

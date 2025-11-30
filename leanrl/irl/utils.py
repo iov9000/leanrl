@@ -390,9 +390,9 @@ def demos_gen_dict(data, batch_size, shuffle=False):
     if batch_size <= 0:
         return
 
-    b_inds = np.arange(len(data["obs"]))
+    b_inds = torch.arange(len(data["obs"]), device=data["obs"].device, dtype=torch.long)
     if shuffle:
-        np.random.shuffle(b_inds)
+        b_inds = torch.randperm(len(data["obs"]), device=data["obs"].device)
 
     for i in range(0, len(data["obs"]), batch_size):
         end = i + batch_size
@@ -496,70 +496,73 @@ def prepare_batch_update_irl(
 ):
     ac_sample = env.single_action_space.sample()
 
-    # print(obs.shape, acs.shape, dones.shape, expert_demos['obs'].shape, expert_demos['acs'].shape, expert_demos['done'].shape)
-
     if isinstance(ac_sample, int) or isinstance(ac_sample, np.int64):
         ac_shape = 1
     else:
         ac_shape = ac_sample.shape[-1]
 
+    # choose device based on policy/obs
     if isinstance(obs, torch.Tensor):
-        obs = obs.cpu().numpy()
-    if isinstance(acs, torch.Tensor):
-        acs = acs.cpu().numpy()
-    if isinstance(dones, torch.Tensor):
-        dones = np.squeeze(dones.cpu().numpy())
+        device = obs.device
+    else:
+        try:
+            device = next(policy.parameters()).device  # type: ignore[arg-type]
+        except Exception:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def to_tensor(x, dtype=torch.get_default_dtype(), squeeze=False):
+        t = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
+        if dtype is not None:
+            t = t.to(dtype=dtype)
+        t = t.to(device)
+        if squeeze:
+            t = torch.squeeze(t)
+        return t
+
+    obs_t = to_tensor(obs)
+    acs_t = to_tensor(acs)
+    dones_t = to_tensor(dones, squeeze=True)
 
     # flatten first dimension to use samples from all env
     if "atari" in opt.exp_name:
-        # acs = np.reshape(acs, (-1,1))
-        obs = np.reshape(obs, [-1, *obs.shape[2:]])
-        acs = np.reshape(acs, [-1, ac_shape])
-
-        dones = np.reshape(dones, (-1))
+        obs_t = obs_t.reshape(-1, *obs_t.shape[2:])
+        acs_t = acs_t.reshape(-1, ac_shape)
+        dones_t = dones_t.reshape(-1)
     else:
-        obs = np.reshape(obs, [-1, obs.shape[-1]])
-        acs = np.reshape(acs, [-1, ac_shape])
+        obs_t = obs_t.reshape(-1, obs_t.shape[-1])
+        acs_t = acs_t.reshape(-1, ac_shape)
         if ac_shape == 1:
-            acs = np.squeeze(acs, -1)
+            acs_t = acs_t.squeeze(-1)
+        dones_t = dones_t.reshape(-1)
 
-        # DONES make a big difference?
-        # print(dones.shape)
-        dones = np.reshape(dones, (-1))
-
-    obs_next = np.concatenate([obs[1:], np.expand_dims(obs[-1], 0)], axis=0)
+    obs_next_t = torch.cat([obs_t[1:], obs_t[-1:].clone()], dim=0)
 
     # sample expert_demos
     if isinstance(expert_demos, dict):
-        rewards = expert_demos["rew"]
-        expert_obs = expert_demos["obs"]
-        expert_acs = expert_demos["acs"]
-        # expert_dones = np.squeeze(expert_demos['done'])
-        expert_dones = expert_demos["done"]
+        expert_obs_t = to_tensor(expert_demos["obs"])
+        expert_acs_t = to_tensor(expert_demos["acs"])
+        expert_dones_t = to_tensor(expert_demos["done"])
     else:
         expert_ob_ac_done_reward = expert_demos  # [np.random.randint(0, expert_demos.shape[0], opt.batch_size), :]
-        expert_dones = expert_ob_ac_done_reward[:, -1]
-        rewards = expert_ob_ac_done_reward[:, -2]
+        expert_dones_t = to_tensor(expert_ob_ac_done_reward[:, -1])
+        # rewards = expert_ob_ac_done_reward[:, -2]
         expert_ob_ac = expert_ob_ac_done_reward[:, :-2]
-        expert_obs = expert_ob_ac[:, :-ac_shape]
-        expert_acs = expert_ob_ac[:, -ac_shape:]
+        expert_obs_t = to_tensor(expert_ob_ac[:, :-ac_shape])
+        expert_acs_t = to_tensor(expert_ob_ac[:, -ac_shape:])
 
-    expert_obs_next = np.concatenate(
-        [expert_obs[1:], np.expand_dims(expert_obs[-1], 0)], axis=0
+    if ac_shape == 1 and expert_acs_t.dim() > 1 and expert_acs_t.shape[-1] == 1:
+        expert_acs_t = expert_acs_t.squeeze(-1)
+
+    expert_obs_next_t = torch.cat(
+        [expert_obs_t[1:], expert_obs_t[-1:].clone()], dim=0
     )  # repeat last observation
 
-    N = expert_obs.shape[0]
+    N = expert_obs_t.shape[0]
     T = 1000
 
     # policy_traj = np.empty((N, T, obs.shape[-1]), dtype=np.float32)
     # a_buffer = np.empty((N, T-1, ac_shape), dtype=np.float32)
     # expert_traj = np.empty((N, T, obs.shape[-1]), dtype=np.float32)
-
-    # convert to torch tensors
-    obs_t = torch.from_numpy(obs).type(torch.get_default_dtype())
-    acs_t = torch.from_numpy(acs).type(torch.get_default_dtype())
-    expert_obs_t = torch.from_numpy(expert_obs).type(torch.get_default_dtype())
-    expert_acs_t = torch.from_numpy(expert_acs).type(torch.get_default_dtype())
 
     # policy_ob_ac = np.concatenate([obs, acs], 1)
     # eval lprobs conditioned on obs, acs
@@ -569,51 +572,34 @@ def prepare_batch_update_irl(
     # only necessary for AIRL
     if compute_lprobs:
         with torch.no_grad():
-            if torch.cuda.is_available():
-                if getattr(opt, 'on_policy', False):
+            if getattr(opt, "on_policy", False):
+                if not opt.use_actions:
                     _, expert_lprobs_t, _, _ = policy.get_action_and_value(
-                        expert_obs_t.cuda(), expert_acs_t.cuda()
-                    )
-                    _, policy_lprobs_t, _, _ = policy.get_action_and_value(
-                        obs_t.cuda(), acs_t.cuda()
+                        expert_obs_t
                     )
                 else:
-                    _, expert_lprobs_t, _ = policy.get_action(expert_obs_t.cuda())
-                    _, policy_lprobs_t, _ = policy.get_action(obs_t.cuda())
-            else:
-                if getattr(opt, 'on_policy', False):
-                    if not opt.use_actions:
-                        _, expert_lprobs_t, _, _ = policy.get_action_and_value(
-                            expert_obs_t
-                        )
-                    else:
-                        _, expert_lprobs_t, _, _ = policy.get_action_and_value(
-                            expert_obs_t, expert_acs_t
-                        )
+                    _, expert_lprobs_t, _, _ = policy.get_action_and_value(
+                        expert_obs_t, expert_acs_t
+                    )
 
-                    _, policy_lprobs_t, _, _ = policy.get_action_and_value(
-                        obs_t, acs_t
-                    )
-                else:
-                    _, expert_lprobs_t, _ = policy.get_action(expert_obs_t)
-                    _, policy_lprobs_t, _ = policy.get_action(obs_t)
+                _, policy_lprobs_t, _, _ = policy.get_action_and_value(
+                    obs_t, acs_t
+                )
+            else:
+                _, expert_lprobs_t, _ = policy.get_action(expert_obs_t)
+                _, policy_lprobs_t, _ = policy.get_action(obs_t)
     else:
         policy_lprobs_t = torch.zeros_like(acs_t)
         expert_lprobs_t = torch.zeros_like(expert_acs_t)
 
-    expert_obs_next_t = torch.from_numpy(expert_obs_next).type(
-        torch.get_default_dtype()
-    )
-    expert_dones_t = torch.from_numpy(expert_dones).type(torch.get_default_dtype())
-
     policy_obs_t = obs_t
     policy_acs_t = acs_t
-    policy_obs_next_t = torch.from_numpy(obs_next).type(torch.get_default_dtype())
-    policy_dones_t = torch.from_numpy(dones).type(torch.get_default_dtype())
-    all_obs_t = torch.cat([expert_obs_t, obs_t], axis=0)
-    all_obs_next_t = torch.cat([expert_obs_next_t, policy_obs_next_t], axis=0)
+    policy_obs_next_t = obs_next_t
+    policy_dones_t = dones_t
+    all_obs_t = torch.cat([expert_obs_t, obs_t], dim=0)
+    all_obs_next_t = torch.cat([expert_obs_next_t, policy_obs_next_t], dim=0)
     if expert_acs_t.shape[-1] == acs_t.shape[-1]:
-        all_acs_t = torch.cat([expert_acs_t, acs_t], axis=0)
+        all_acs_t = torch.cat([expert_acs_t, acs_t], dim=0)
         all_lprobs_t = torch.cat([expert_lprobs_t, policy_lprobs_t]).type(
             torch.get_default_dtype()
         )
@@ -621,26 +607,9 @@ def prepare_batch_update_irl(
         all_lprobs_t = torch.cat(
             [torch.zeros_like(policy_lprobs_t), policy_lprobs_t]
         ).type(torch.get_default_dtype())
-        all_acs_t = torch.cat([torch.zeros_like(acs_t), acs_t], axis=0)
+        all_acs_t = torch.cat([torch.zeros_like(acs_t), acs_t], dim=0)
 
-    all_dones_t = torch.cat([expert_dones_t, policy_dones_t], axis=0)
-
-    if torch.cuda.is_available():
-        expert_obs_t = expert_obs_t.cuda()
-        expert_obs_next_t = expert_obs_next_t.cuda()
-        expert_acs_t = expert_acs_t.cuda()
-        expert_lprobs_t = expert_lprobs_t.cuda()
-        expert_dones_t = expert_dones_t.cuda()
-        policy_obs_next_t = policy_obs_next_t.cuda()
-        policy_obs_t = policy_obs_t.cuda()
-        policy_acs_t = policy_acs_t.cuda()
-        policy_lprobs_t = policy_lprobs_t.cuda()
-        policy_dones_t = policy_dones_t.cuda()
-        all_obs_next_t = all_obs_next_t.cuda()
-        all_obs_t = all_obs_t.cuda()
-        all_acs_t = all_acs_t.cuda()
-        all_lprobs_t = all_lprobs_t.cuda()
-        all_dones_t = all_dones_t.cuda()
+    all_dones_t = torch.cat([expert_dones_t, policy_dones_t], dim=0)
 
     update_dict = {}
     update_dict["expert_obs"] = expert_obs_t
@@ -651,25 +620,20 @@ def prepare_batch_update_irl(
 
     if load_support:
         if isinstance(expert_demos, dict):
-            support_obs = expert_demos["support_obs"]
-            support_acs = expert_demos["support_acs"]
-            support_done = expert_demos["support_done"]
-            support_obs_next = np.concatenate(
-                [support_obs[1:], np.expand_dims(support_obs[-1], 0)], axis=0
-            )  # repeat last observation
-
-        support_obs_t = torch.from_numpy(support_obs).type(torch.get_default_dtype())
-        support_acs_t = torch.from_numpy(support_acs).type(torch.get_default_dtype())
-        support_dones_t = torch.from_numpy(support_done).type(torch.get_default_dtype())
-        support_obs_next_t = torch.from_numpy(support_obs_next).type(
-            torch.get_default_dtype()
-        )
-
-        if torch.cuda.is_available():
-            support_obs_t = support_obs_t.cuda()
-            support_obs_next_t = support_obs_next_t.cuda()
-            support_acs_t = support_acs_t.cuda()
-            support_dones_t = support_dones_t.cuda()
+            support_obs_t = to_tensor(expert_demos["support_obs"])
+            support_acs_t = to_tensor(expert_demos["support_acs"])
+            support_dones_t = to_tensor(expert_demos["support_done"])
+            if ac_shape == 1 and support_acs_t.dim() > 1 and support_acs_t.shape[-1] == 1:
+                support_acs_t = support_acs_t.squeeze(-1)
+            support_obs_next_t = torch.cat(
+                [support_obs_t[1:], support_obs_t[-1:].clone()], dim=0
+            )
+        else:
+            # fallback: reuse expert tensors if support set is not provided as dict
+            support_obs_t = expert_obs_t
+            support_acs_t = expert_acs_t
+            support_dones_t = expert_dones_t
+            support_obs_next_t = expert_obs_next_t
 
         update_dict["support_obs"] = support_obs_t
         update_dict["support_obs_next"] = support_obs_next_t

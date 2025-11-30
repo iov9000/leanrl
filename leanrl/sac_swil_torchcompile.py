@@ -89,6 +89,7 @@ class Args:
     replace_atoms_ouo: bool = False
     aligned_index: bool = False
     atom_weight: str = "1/n"
+    shuffle_irl_batches: bool = False
     shuffle_atom_batches: bool = False
     add_proj_noise: bool = False
     use_cnn_base: bool = False
@@ -103,6 +104,7 @@ class Args:
     lip_coeff: float = 0.0
     lip_p: float = 1.0
     l2_coeff: float = 0.0
+    proj_norm_coeff: float = 0.0
     irl_epochs: int = 1
     irl_init_epochs: int = 1
     warmup_irl: bool = False
@@ -445,11 +447,12 @@ if __name__ == "__main__":
         update_main = torch.compile(update_main, mode=mode)
         update_pol = torch.compile(update_pol, mode=mode)
         policy = torch.compile(policy, mode=mode)
+        update_disc = torch.compile(update_disc, mode=mode)
 
     if args.cudagraphs:
         update_main = CudaGraphModule(update_main, in_keys=[], out_keys=[])
         update_pol = CudaGraphModule(update_pol, in_keys=[], out_keys=[])
-        # Do not wrap update_disc: it takes a regular argument and shapes can vary.
+        # update_disc will be captured manually below once we see a first batch.
 
     # Eval helpers: load and evaluate actor
     def load_actor(weights_path: str):
@@ -561,9 +564,12 @@ if __name__ == "__main__":
     obs = torch.as_tensor(obs, dtype=torch.float)
     pbar = tqdm.tqdm(range(args.total_timesteps))
     start_time = None
-    max_ep_ret = -float("inf")
+    max_ep_ret, max_ep_ret_irl = -float("inf"), -float("inf")
     avg_returns = deque(maxlen=20)
+    avg_irl_returns = deque(maxlen=20)
     init_disc_training = True  # Flag for initial discriminator training
+    disc_graph = None
+    disc_buffers = None
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -629,7 +635,11 @@ if __name__ == "__main__":
             for r in infos["episode"]["r"][infos["episode"]["_r"]]:
                 max_ep_ret = max(max_ep_ret, r)
                 avg_returns.append(r)
-            desc = f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f})"
+            for r in infos["episode"]["ep_rew_irl"]:
+                max_ep_ret_irl = max(max_ep_ret_irl, r)
+                avg_irl_returns.append(r)
+            desc = (f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f}),"  
+                    f"episodic_return_irl={torch.tensor(avg_irl_returns).mean(): 4.2f} (max={max_ep_ret_irl: 4.2f})")
 
         next_obs = torch.as_tensor(next_obs, device=device, dtype=torch.float)
         real_next_obs = next_obs.clone()
@@ -683,7 +693,7 @@ if __name__ == "__main__":
                 init_disc_training = False  # Only use init_epochs once
                 for _ in range(n_irl_epochs):
                     gen_demos = demos_gen_dict(
-                        demos_all, args.batch_size, shuffle=args.shuffle_atom_batches
+                        demos_all, args.batch_size, shuffle=args.shuffle_irl_batches
                     )
 
                     for d in gen_demos:
@@ -707,7 +717,22 @@ if __name__ == "__main__":
                             dones_,
                             actor,
                         )
-                        out_disc = update_disc(ud)
+                        if args.cudagraphs:
+                            # SWIL demo batches can vary in size; recapture if shapes differ
+                            if disc_graph is None or any(
+                                disc_buffers[k].shape != ud[k].shape for k in ud
+                            ):
+                                disc_buffers = {k: v.clone() for k, v in ud.items()}
+                                disc_graph = torch.cuda.make_graphed_callables(
+                                    update_disc, (disc_buffers,)
+                                )
+                                out_disc = disc_graph(disc_buffers)
+                            else:
+                                for k in disc_buffers:
+                                    disc_buffers[k].copy_(ud[k])
+                                out_disc = disc_graph(disc_buffers)
+                        else:
+                            out_disc = update_disc(ud)
 
                 if global_step % 100 == 0:
                     wandb.log(

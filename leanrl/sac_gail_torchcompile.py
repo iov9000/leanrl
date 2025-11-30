@@ -144,6 +144,7 @@ class Args:
     policy_lr: float = 3e-4
     q_lr: float = 1e-3
     policy_frequency: int = 2
+    disc_period: int = 100  # -1 to update on episode completion
     target_network_frequency: int = 1
     alpha: float = 0.2
     autotune: bool = True
@@ -450,6 +451,7 @@ if __name__ == "__main__":
     # Discriminator update (compilable + cudagraph-eligible)
     def update_disc(ud):
         loss_dict = disc.compute_loss(ud)
+        print(ud['policy_obs'].shape)
         total_loss = (
             loss_dict["d_loss"]
             + args.irm_coeff * loss_dict["grad_penalty"]
@@ -470,11 +472,12 @@ if __name__ == "__main__":
         update_main = torch.compile(update_main, mode=mode)
         update_pol = torch.compile(update_pol, mode=mode)
         policy = torch.compile(policy, mode=mode)
+        update_disc = torch.compile(update_disc, mode=mode)
 
     if args.cudagraphs:
         update_main = CudaGraphModule(update_main, in_keys=[], out_keys=[])
         update_pol = CudaGraphModule(update_pol, in_keys=[], out_keys=[])
-        # Do not wrap update_disc: it takes a regular argument and shapes can vary.
+        # update_disc will be captured manually below once we see a first batch.
 
     # Eval helpers: load and evaluate actor
     def load_actor(weights_path: str):
@@ -588,9 +591,12 @@ if __name__ == "__main__":
     max_ep_ret = -float("inf")
     avg_returns = deque(maxlen=20)
     desc = ""
+    disc_graph = None
+    disc_buffers = None
 
     os.makedirs(args.save_dir, exist_ok=True)
     for global_step in pbar:
+        irl_trigger = False
         if global_step == args.measure_burnin + args.learning_starts:
             start_time = time.time()
             measure_burnin = global_step
@@ -609,6 +615,7 @@ if __name__ == "__main__":
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         if "episode" in infos:
+            irl_trigger = True
             for r in infos["episode"]["r"][infos["episode"]["_r"]]:
                 max_ep_ret = max(max_ep_ret, r)
                 avg_returns.append(r)
@@ -636,20 +643,50 @@ if __name__ == "__main__":
         obs = next_obs
         rb.extend(transition)
 
-        # Discriminator periodic update using replay samples
+        # ALGO LOGIC: training SAC
         if global_step > args.learning_starts:
-            data_disc = rb.sample(args.batch_size)
-            ud = prepare_batch_update_irl_gpu(
-                envs,
-                args,
-                demos_all,
-                data_disc["observations"],
-                data_disc["actions"],
-                data_disc["dones"],
-                actor,
-            )
-            out_disc = update_disc(ud)
-            if global_step % 100 == 0 and args.track:
+            data = rb.sample(args.batch_size)
+            out_disc = None
+            out_main = update_main(data)
+            if global_step % args.policy_frequency == 0:
+                for _ in range(args.policy_frequency):
+                    out_main.update(update_pol(data))
+                    if args.autotune:
+                        alpha.copy_(log_alpha.detach().exp())
+
+            if global_step % args.target_network_frequency == 0:
+                qnet_target.lerp_(qnet_params.data, args.tau)
+
+            # Discriminator update using the SAME data batch that SAC just trained on
+            irl_condition = global_step % args.disc_period == 0
+            if args.disc_period == -1:
+                irl_condition = irl_trigger
+            if irl_condition:
+                ud = prepare_batch_update_irl(
+                    envs,
+                    args,
+                    demos_all,
+                    data["observations"],
+                    data["actions"],
+                    data["dones"],
+                    actor,
+                )
+                if args.cudagraphs:
+                    if disc_graph is None:
+                        # Clone static buffers to reuse storage across iterations
+                        disc_buffers = {k: v.clone() for k, v in ud.items()}
+                        disc_graph = torch.cuda.make_graphed_callables(
+                            update_disc, (disc_buffers,)
+                        )
+                        out_disc = disc_graph(disc_buffers)
+                    else:
+                        for k in disc_buffers:
+                            disc_buffers[k].copy_(ud[k])
+                        out_disc = disc_graph(disc_buffers)
+                else:
+                    out_disc = update_disc(ud)
+
+            if args.track and global_step % 100 == 0 and out_disc is not None:
                 wandb.log(
                     {
                         "irl/d_loss": out_disc["d_loss"].mean().item(),
@@ -661,19 +698,6 @@ if __name__ == "__main__":
                     },
                     step=global_step,
                 )
-
-        # ALGO LOGIC: training SAC
-        if global_step > args.learning_starts:
-            data = rb.sample(args.batch_size)
-            out_main = update_main(data)
-            if global_step % args.policy_frequency == 0:
-                for _ in range(args.policy_frequency):
-                    out_main.update(update_pol(data))
-                    if args.autotune:
-                        alpha.copy_(log_alpha.detach().exp())
-
-            if global_step % args.target_network_frequency == 0:
-                qnet_target.lerp_(qnet_params.data, args.tau)
 
             if args.save_interval and global_step % args.save_interval == 0:
                 ckpt_actor = os.path.join(

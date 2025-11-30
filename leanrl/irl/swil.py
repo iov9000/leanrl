@@ -9,7 +9,6 @@ from torch.optim.lr_scheduler import ExponentialLR
 import copy
 
 from collections import deque
-from sklearn.utils import shuffle
 
 from torch.nn.utils import spectral_norm, weight_norm
 from irl.utils import MiniGridCNN, AtariCNNBase, gaussian_kld
@@ -162,6 +161,7 @@ class SWILDiscriminator(nn.Module):
         self.reward_type = opt.swil_reward_type
         self.is_atari = "atari" in self.opt.exp_name
         self.swil_vb = opt.swil_vb
+        self.proj_norm_coeff = opt.proj_norm_coeff
         self.i_c = opt.i_c
         self.beta = torch.tensor(opt.min_beta, dtype=torch.float)
         self.alpha_beta = opt.vb_coeff
@@ -350,15 +350,15 @@ class SWILDiscriminator(nn.Module):
         if self.opt.proj_layer:
             return self.proj_layer(self.reward(vb_out)), z, mu, std
         else:
-            # XXX: additional noise?
+            # XXX: additional noise?            
             rew = self.reward(vb_out)
             #rew = rew / (rew.norm(dim=-1, keepdim=True) + 1e-6)
 
             # perturb with noise -> TODO: sample from stochastic (e.g. Gaussian) process?
             if self.opt.n_proj > 1:
-                rew + torch.randn_like(rew) * 0.01
+                rew += torch.randn_like(rew) * 0.01
             if self.opt.add_proj_noise:
-                rew + torch.randn_like(rew) * 0.01
+                rew += torch.randn_like(rew) * 0.01
 
             # out = rew/rew.norm(-1)
             return rew, z, mu, std  # + torch.randn_like(self.reward(base_out))
@@ -428,13 +428,8 @@ class SWILDiscriminator(nn.Module):
     def compute_replacement_reward(self, ob, ac, nob=None, d=None, step=None):
         with torch.no_grad():
             # project next state and rank it as part of previous evaluation
-            base_out = self.base_fwd(self.base, ob, ac, nob, d)
-            if self.swil_vb > 0:
-                vb_out, z, mu, std = self.vb(base_out, noise=False)
-            else:
-                vb_out = base_out
-
-            obs_t_slice = self.reward(vb_out).unsqueeze(0)
+            proj, _, _, _ = self.proj(ob,ac,nob,d)
+            obs_t_slice = proj.unsqueeze(0)
 
             rew = torch.zeros(1, device=obs_t_slice.device)
 
@@ -801,33 +796,12 @@ class SWILDiscriminator(nn.Module):
             exp_slices, dim=0, stable=True
         )
 
-        if self.opt.shuffle_atom_batches:
-            if len(self.pi_atoms_sorted) == 0:
-                self.pi_atoms_sorted.append(pi_slices_sorted)
-                self.exp_atoms_sorted.append(exp_slices_sorted)
-                self.pi_atoms_sorted_idx.append(pi_slices_sorted_idx)
-                self.exp_atoms_sorted_idx.append(exp_slices_sorted_idx)
-            elif np.random.rand() > 0.5:
-                self.pi_atoms_sorted.append(pi_slices_sorted)
-                self.exp_atoms_sorted.append(exp_slices_sorted)
-                self.pi_atoms_sorted_idx.append(pi_slices_sorted_idx)
-                self.exp_atoms_sorted_idx.append(exp_slices_sorted_idx)
-        else:
-            self.pi_atoms_sorted.append(pi_slices_sorted)
-            self.exp_atoms_sorted.append(exp_slices_sorted)
-            self.pi_atoms_sorted_idx.append(pi_slices_sorted_idx)
-            self.exp_atoms_sorted_idx.append(exp_slices_sorted_idx)
+        self.pi_atoms_sorted.append(pi_slices_sorted)
+        self.exp_atoms_sorted.append(exp_slices_sorted)
+        self.pi_atoms_sorted_idx.append(pi_slices_sorted_idx)
+        self.exp_atoms_sorted_idx.append(exp_slices_sorted_idx)
 
-        # shuffle atom batches
-        if self.opt.shuffle_atom_batches:
-            self.pi_atoms_sorted, self.pi_atoms_sorted_idx = shuffle(
-                self.pi_atoms_sorted, self.pi_atoms_sorted_idx, random_state=0
-            )
-            self.exp_atoms_sorted, self.exp_atoms_sorted_idx = shuffle(
-                self.exp_atoms_sorted, self.exp_atoms_sorted_idx, random_state=0
-            )
-
-        return torch.sqrt(torch.sum((pi_slices_sorted - exp_slices_sorted) ** 2))
+        return torch.sqrt(torch.sum((pi_slices_sorted - exp_slices_sorted) ** 2)), torch.norm(pi_slices), torch.norm(exp_slices)
 
     def atom_gsw(self, obs_pi, acs_pi, obs_exp, acs_exp, random=False):
         """
@@ -1043,11 +1017,11 @@ class SWILDiscriminator(nn.Module):
             irm_pen = 0
         else:
             if self.opt.max_gsw:
-                gsw_dist = self.max_gsw(
+                gsw_dist, pi_proj_norm, exp_proj_norm = self.max_gsw(
                     self.policy_obs, self.policy_acs, exp_obs, exp_acs
                 )
             else:
-                gsw_dist = -self.gsw_dist_nn(
+                gsw_dist, pi_proj_norm, exp_proj_norm = self.gsw_dist_nn(
                     self.policy_obs,
                     self.policy_acs,
                     policy_obs_next,
@@ -1058,7 +1032,8 @@ class SWILDiscriminator(nn.Module):
                     exp_dones,
                     random=False,
                 )
-            d_loss = gsw_dist
+
+            d_loss = -gsw_dist + self.proj_norm_coeff*(pi_proj_norm+exp_proj_norm)
             irm_pen = 0
 
         output_dict = {}
@@ -1312,8 +1287,6 @@ class SwilReward(gym.Wrapper):
         self.traj_.append(irl_reward.item())
         # print("GT: ", gt_reward, "IRL: ", irl_reward)
         if done:
-            print("episode reward gt:", np.sum(np.array(self.traj)))
-            print("episode reward irl:", np.sum(np.array(self.traj_)))
             info["episode"]["ep_rew_irl"] = np.sum(np.array(self.traj_))
             self.traj = []
             self.traj_ = []
