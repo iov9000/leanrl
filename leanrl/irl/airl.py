@@ -1,19 +1,29 @@
+from __future__ import annotations
+
+from argparse import Namespace
+from typing import Dict, Mapping, Tuple
+
 import gymnasium as gym
 import numpy as np
 import torch
+import torch.autograd as autograd
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.autograd as autograd
 from torch.distributions.normal import Normal
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+TensorDict = Mapping[str, torch.Tensor]
+
+
+def layer_init(
+    layer: nn.Linear, std: float = np.sqrt(2), bias_const: float = 0.0
+) -> nn.Linear:
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
 class AIRLDiscriminator(nn.Module):
-    def __init__(self, env, args):
+    def __init__(self, env: gym.Env, args: Namespace) -> None:
         super().__init__()
         self.env = env
         self.args = args
@@ -59,7 +69,13 @@ class AIRLDiscriminator(nn.Module):
         # Move parameters to GPU when available/allowed so downstream tensors match
         self.to(self.device)
         
-    def forward(self, obs, next_obs, acs, lprobs):
+    def forward(
+        self,
+        obs: torch.Tensor,
+        next_obs: torch.Tensor,
+        acs: torch.Tensor | None,
+        lprobs: torch.Tensor | None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # g(s,a)
         if self.use_actions:
             x = torch.cat([obs, acs], dim=-1)
@@ -92,18 +108,28 @@ class AIRLDiscriminator(nn.Module):
 
         return logits, reward, value, next_value
 
-    def get_reward(self, obs, next_obs, acs, lprobs):
+    def get_reward(
+        self,
+        obs: torch.Tensor,
+        next_obs: torch.Tensor,
+        acs: torch.Tensor | None,
+        lprobs: torch.Tensor | None,
+    ) -> torch.Tensor:
         # Return the AIRL logit f(s,a,s') - log_pi(a|s), which is the shaped reward.
         logits, _, _, _ = self.forward(obs, next_obs, acs, lprobs)
         return logits.squeeze(-1)
 
-    def irm_penalty(self, logits, labels):
+    def irm_penalty(
+        self, logits: torch.Tensor, labels: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         scale = torch.tensor(1.0, device=logits.device, requires_grad=True)
         loss = F.binary_cross_entropy_with_logits(logits * scale, labels)
         grad = autograd.grad(loss, [scale], create_graph=True)[0]
         return torch.sum(grad**2), grad
 
-    def lip_penalty(self, update_dict, p=1.0):
+    def lip_penalty(
+        self, update_dict: TensorDict, p: float = 1.0
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
         policy_obs = update_dict["policy_obs"]
         policy_obs_next = update_dict["policy_obs_next"]
         policy_acs = update_dict["policy_acs"]
@@ -163,7 +189,7 @@ class AIRLDiscriminator(nn.Module):
         grad_mix = torch.cat(grads_flat, dim=1)
         return penalty, grad_mix
 
-    def compute_loss(self, update_dict):
+    def compute_loss(self, update_dict: TensorDict) -> Dict[str, torch.Tensor | None]:
         # Expert/policy batches
         expert_obs = update_dict["expert_obs"].to(self.device, non_blocking=True)
         expert_obs_next = update_dict["expert_obs_next"].to(self.device, non_blocking=True)

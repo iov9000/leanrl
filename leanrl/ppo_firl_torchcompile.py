@@ -17,8 +17,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule, CudaGraphModule
 
-from leanrl.irl.firl import fIRLDiscriminator
-from leanrl.irl.utils import load_hf_demos, prepare_batch_update_irl, demos_gen_dict
+from irl.firl import fIRLDiscriminator
+from irl.utils import load_hf_demos, prepare_batch_update_irl, demos_gen_dict
 
 @dataclass
 class Args:

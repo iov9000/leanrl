@@ -24,8 +24,8 @@ from tensordict import from_module
 from tensordict.nn import CudaGraphModule
 from torch.distributions.normal import Normal
 
-from leanrl.irl.airl import AIRLDiscriminator
-from leanrl.irl.utils import load_hf_demos
+from irl.airl import AIRLDiscriminator
+from irl.utils import load_hf_demos
 
 @dataclass
 class Args:

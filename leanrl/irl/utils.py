@@ -1,23 +1,36 @@
+from __future__ import annotations
+
 import os
+import pickle
+from argparse import Namespace
+from collections import deque
+from collections.abc import Generator, Sequence
+from datetime import datetime
+from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+import gymnasium as gym
+import matplotlib.pyplot as plt
 import numpy as np
+import ot
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-import ot
-import gymnasium as gym
-import pickle
-from datetime import datetime
-import matplotlib.pyplot as plt
-import pandas as pd
-from collections import deque
 
-from typing import Optional
+DemoDict = Dict[str, Dict[str, np.ndarray]]
+TensorDict = Dict[str, torch.Tensor]
 
 # from drqv2 import DrQV2Agent, Encoder
 
 
-def load_hf_demos(args, n_demos, perturb=0.0, bary_enhance=False, load_support=False):
+def load_hf_demos(
+    args: Namespace,
+    n_demos: int,
+    perturb: float = 0.0,
+    bary_enhance: bool = False,
+    load_support: bool = False,
+) -> DemoDict:
     folder = args.demo_dir
     env_name = args.env_id
     subsample = args.subsample
@@ -65,7 +78,9 @@ def load_hf_demos(args, n_demos, perturb=0.0, bary_enhance=False, load_support=F
     return expert_demos
 
 
-def load_hf_demos_name(args, fnames, load_support=False):
+def load_hf_demos_name(
+    args: Namespace, fnames: Sequence[str], load_support: bool = False
+) -> DemoDict:
     folder = args.demo_dir
     env_name = args.env_id
     subsample = args.subsample
@@ -136,14 +151,14 @@ def load_hf_demos_name(args, fnames, load_support=False):
 
 
 def load_fast_demos(
-    args,
-    filename,
-    n_demos=1,
-    bary_enhance=False,
-    offset=100,
-    obs_shape=3,
-    load_support=False,
-):
+    args: Namespace,
+    filename: str,
+    n_demos: int = 1,
+    bary_enhance: bool = False,
+    offset: int = 100,
+    obs_shape: int = 3,
+    load_support: bool = False,
+) -> DemoDict:
     expert_demos = {}
     folder = args.demo_dir
     subsample = args.subsample
@@ -168,15 +183,15 @@ def load_fast_demos(
 
 
 def load_lap_demos(
-    folder="demos/davos_data",
-    n_demos=1,
-    bary_enhance=False,
-    offset=500,
-    obs_shape=3,
-    filter_by_score=False,
-    flip_z=False,
-    load_support=False,
-):
+    folder: str = "demos/davos_data",
+    n_demos: int = 1,
+    bary_enhance: bool = False,
+    offset: int = 500,
+    obs_shape: int = 3,
+    filter_by_score: bool = False,
+    flip_z: bool = False,
+    load_support: bool = False,
+) -> DemoDict:
     expert_demos = {}
     obs = []
     obs_full = []
@@ -252,7 +267,9 @@ def load_lap_demos(
     return {"all": expert_demos}
 
 
-def get_trajectory_list(demos, oa_cat=False):
+def get_trajectory_list(
+    demos: Mapping[str, np.ndarray], oa_cat: bool = False
+) -> List[np.ndarray]:
     done_cnt = 0
     trajs = []
     ep = []
@@ -277,11 +294,18 @@ def get_trajectory_list(demos, oa_cat=False):
     return trajs
 
 
-def gaussian_kld(mu, logvar):
+def gaussian_kld(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     return -0.5 * torch.sum(1 + logvar - mu**2 - logvar.exp(), dim=1)
 
 
-def compute_sw_barycenter(a, b, lr=1e3, nb_iter_max=1000, bary_size=1000, n_proj=100):
+def compute_sw_barycenter(
+    a: np.ndarray,
+    b: np.ndarray,
+    lr: float = 1e3,
+    nb_iter_max: int = 1000,
+    bary_size: int = 1000,
+    n_proj: int = 100,
+) -> np.ndarray:
     x1_torch = torch.from_numpy(a)
     x2_torch = torch.from_numpy(b)
     xbinit = np.random.randn(bary_size, a.shape[-1]).astype(np.float32)
@@ -319,7 +343,7 @@ def compute_sw_barycenter(a, b, lr=1e3, nb_iter_max=1000, bary_size=1000, n_proj
     return xb
 
 
-def enhance_demos_with_eps_balls(args, demos):
+def enhance_demos_with_eps_balls(args: Namespace, demos: DemoDict) -> List[np.ndarray]:
     add_obs_list = []
     test_env = gym.make(args.env_id)
     for obs in demos["all"]["obs"]:
@@ -332,8 +356,14 @@ def enhance_demos_with_eps_balls(args, demos):
 
 
 def enhance_demos_with_barycenters(
-    args, demos, test_env, lr=1e3, nb_iter_max=1000, bary_size=1000, n_proj=100
-):
+    args: Namespace,
+    demos: DemoDict,
+    test_env: gym.Env,
+    lr: float = 1e3,
+    nb_iter_max: int = 1000,
+    bary_size: int = 1000,
+    n_proj: int = 100,
+) -> DemoDict:
     demo_list = get_trajectory_list(demos["all"], args.use_actions)
     pairs = [(a, b) for idx, a in enumerate(demo_list) for b in demo_list[idx + 1 :]]
     barys = []
@@ -377,7 +407,9 @@ def enhance_demos_with_barycenters(
     return demos
 
 
-def demos_gen(data, batch_size):
+def demos_gen(
+    data: Sequence[np.ndarray], batch_size: int
+) -> Generator[Sequence[np.ndarray], None, None]:
     """Yields batch of specified size"""
     if batch_size <= 0:
         return
@@ -385,7 +417,12 @@ def demos_gen(data, batch_size):
         yield data[i : i + batch_size]
 
 
-def demos_gen_dict(data, batch_size, shuffle=False):
+def demos_gen_dict(
+    data: Mapping[str, torch.Tensor],
+    batch_size: int,
+    shuffle: bool = False,
+    drop_last: bool = False,
+) -> Generator[TensorDict, None, None]:
     """Yields batch of specified size"""
     if batch_size <= 0:
         return
@@ -396,6 +433,8 @@ def demos_gen_dict(data, batch_size, shuffle=False):
 
     for i in range(0, len(data["obs"]), batch_size):
         end = i + batch_size
+        if drop_last and end > len(data["obs"]):
+            break
         mb_inds = b_inds[i:end]
         yield {
             "obs": data["obs"][mb_inds],
@@ -409,7 +448,9 @@ def demos_gen_dict(data, batch_size, shuffle=False):
         }
 
 
-def demos_sample_batch(data, batch_size, shuffle=False):
+def demos_sample_batch(
+    data: Mapping[str, np.ndarray], batch_size: int, shuffle: bool = False
+) -> Optional[Dict[str, np.ndarray]]:
     """Yields batch of specified size"""
     if batch_size <= 0:
         return
@@ -424,7 +465,11 @@ def demos_sample_batch(data, batch_size, shuffle=False):
     }
 
 
-def get_concat_samples(policy_batch, expert_batch, device):
+def get_concat_samples(
+    policy_batch: Any, expert_batch: Mapping[str, np.ndarray], device: torch.device
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     policy_obs = policy_batch.observations
     policy_acs = policy_batch.actions
     policy_obs_next = policy_batch.next_observations
@@ -484,16 +529,16 @@ def get_concat_samples(policy_batch, expert_batch, device):
 
 
 def prepare_batch_update_irl(
-    env,
-    opt,
-    expert_demos,
-    obs,
-    acs,
-    dones,
-    policy,
-    compute_lprobs=False,
-    load_support=False,
-):
+    env: gym.Env,
+    opt: Namespace,
+    expert_demos: Mapping[str, np.ndarray] | np.ndarray,
+    obs: np.ndarray | torch.Tensor,
+    acs: np.ndarray | torch.Tensor,
+    dones: np.ndarray | torch.Tensor,
+    policy: nn.Module,
+    compute_lprobs: bool = False,
+    load_support: bool = False,
+) -> TensorDict:
     ac_sample = env.single_action_space.sample()
 
     if isinstance(ac_sample, int) or isinstance(ac_sample, np.int64):
@@ -574,17 +619,13 @@ def prepare_batch_update_irl(
         with torch.no_grad():
             if getattr(opt, "on_policy", False):
                 if not opt.use_actions:
-                    _, expert_lprobs_t, _, _ = policy.get_action_and_value(
-                        expert_obs_t
-                    )
+                    _, expert_lprobs_t, _, _ = policy.get_action_and_value(expert_obs_t)
                 else:
                     _, expert_lprobs_t, _, _ = policy.get_action_and_value(
                         expert_obs_t, expert_acs_t
                     )
 
-                _, policy_lprobs_t, _, _ = policy.get_action_and_value(
-                    obs_t, acs_t
-                )
+                _, policy_lprobs_t, _, _ = policy.get_action_and_value(obs_t, acs_t)
             else:
                 _, expert_lprobs_t, _ = policy.get_action(expert_obs_t)
                 _, policy_lprobs_t, _ = policy.get_action(obs_t)
@@ -623,7 +664,11 @@ def prepare_batch_update_irl(
             support_obs_t = to_tensor(expert_demos["support_obs"])
             support_acs_t = to_tensor(expert_demos["support_acs"])
             support_dones_t = to_tensor(expert_demos["support_done"])
-            if ac_shape == 1 and support_acs_t.dim() > 1 and support_acs_t.shape[-1] == 1:
+            if (
+                ac_shape == 1
+                and support_acs_t.dim() > 1
+                and support_acs_t.shape[-1] == 1
+            ):
                 support_acs_t = support_acs_t.squeeze(-1)
             support_obs_next_t = torch.cat(
                 [support_obs_t[1:], support_obs_t[-1:].clone()], dim=0
@@ -659,93 +704,6 @@ def prepare_batch_update_irl(
     update_dict["all_dones"] = all_dones_t
 
     return update_dict
-
-
-class MiniGridCNN(nn.Module):
-    def __init__(self, layer_dims, use_actions=False):
-        super(MiniGridCNN, self).__init__()
-        self.image_conv = nn.Sequential(
-            nn.Conv2d(3, 16, (2, 2)),
-            nn.ReLU(),
-            nn.MaxPool2d((2, 2)),
-            nn.Conv2d(16, 32, (2, 2)),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, (2, 2)),
-            nn.ReLU(),
-        )
-        if use_actions:
-            self.lin = nn.Linear(65, layer_dims[1])
-        else:
-            self.lin = nn.Linear(64, layer_dims[1])
-
-        self.use_actions = use_actions
-
-    def forward(self, x, a=None):
-        x = torch.transpose(x, 1, 3)
-        x = self.image_conv(x)
-        x = x.reshape(x.shape[0], -1)
-        if a is not None and self.use_actions:
-            if len(x.shape) != len(a.shape):
-                ac = torch.unsqueeze(a, -1)
-            x = self.lin(torch.cat([x, torch.unsqueeze(a, -1)], 1))
-        else:
-            x = self.lin(x)
-        return x
-
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
-
-
-class AtariCNNBase(nn.Module):
-    def __init__(self, opt, env, use_actions=False):
-        super().__init__()
-        ob_shapes = list(env.observation_space.shape)
-        ac_shapes = list(env.action_space.shape)
-        if not ac_shapes:
-            ac_shapes = [1]
-
-        if use_actions:
-            ac_dim = ac_shapes[-1]
-        else:
-            ac_dim = 0
-
-        self.obs_network = nn.Sequential(
-            layer_init(nn.Conv2d(4, 32, 8, stride=4)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
-            nn.ReLU(),
-        )
-        # nn.Flatten())
-
-        self.obs_acs_network = nn.Sequential(
-            layer_init(nn.Linear(64 * 7 * 7 + ac_dim, 512)),
-            nn.ReLU(),
-        )
-        # self.critic = layer_init(nn.Linear(512, 1), std=1)
-
-    def forward(self, ob, ac=None):
-        if len(ob.shape) == 3:
-            ob = ob.unsqueeze(0)
-
-        ob_enc = self.obs_network(ob / 255)
-        ob_enc = ob_enc.reshape(ob_enc.shape[0], -1)
-        if ac is not None:
-            if len(ac.shape) == 0:
-                ac = ac.unsqueeze(0).unsqueeze(0)
-            elif len(ac.shape) == 1:
-                ac = ac.unsqueeze(0)
-
-            ob_enc = torch.cat([ob_enc, ac], dim=-1)
-            x = self.obs_acs_network(ob_enc)
-        else:
-            x = self.obs_acs_network(ob_enc)
-
-        return x
 
 
 class ResNetAIRLDisc(nn.Module):
@@ -927,16 +885,16 @@ class Box2dTestWrapper(gym.Wrapper):
 
 
 def evaluate_model(
-    args,
-    actor,
-    device,
-    test_env=None,
-    deterministic=False,
-    wrap_mujoco=False,
-    n_traj=10,
-    save_eval=None,
-    max_step=1e7,
-):
+    args: Namespace,
+    actor: nn.Module,
+    device: torch.device,
+    test_env: gym.Env | None = None,
+    deterministic: bool = False,
+    wrap_mujoco: bool = False,
+    n_traj: int = 10,
+    save_eval: Optional[str] = None,
+    max_step: float = 1e7,
+) -> Tuple[float, float, Dict[str, np.ndarray]]:
     if test_env is None:
         test_env = gym.make(args.env_id)
         if wrap_mujoco:
@@ -972,17 +930,17 @@ def evaluate_model(
 
 
 def save_traj_dict(
-    opt,
-    env_name,
-    env,
-    model,
-    device,
-    nr_trajectories=10,
-    min_total_rew=-1e6,
-    deterministic=True,
-    save_eval=None,
-    max_step=1e7,
-):
+    opt: Namespace,
+    env_name: str,
+    env: gym.Env,
+    model: Any,
+    device: torch.device,
+    nr_trajectories: int | Sequence[int] = 10,
+    min_total_rew: float = -1e6,
+    deterministic: bool = True,
+    save_eval: Optional[str] = None,
+    max_step: float = 1e7,
+) -> Tuple[float, float, Dict[str, np.ndarray]]:
     num_steps = 0
     expert_obs = []
     expert_acs = []
@@ -1193,7 +1151,7 @@ class AdroitResetWrapper(gym.Wrapper):
         return obs, info
 
 
-def drq_weight_init(m):
+def drq_weight_init(m: nn.Module) -> None:
     if isinstance(m, nn.Linear):
         nn.init.orthogonal_(m.weight.data)
         if hasattr(m.bias, "data"):
@@ -1347,7 +1305,7 @@ class FailureBufferWrapper(gym.Wrapper):
         return next_obs, gt_reward + self.weight * reward, term, trunc, info
 
 
-def make_dcm(cfg):
+def make_dcm(cfg: Any) -> gym.Env:
     import dmc2gym
 
     """Helper function to create dm_control environment"""

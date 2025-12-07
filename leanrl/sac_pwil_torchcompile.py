@@ -3,12 +3,11 @@ import os
 os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
 
 import math
-import os
 import random
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from typing import List
+from dataclasses import dataclass
+from typing import Optional
 
 import gymnasium as gym
 import numpy as np
@@ -24,8 +23,8 @@ from tensordict.nn import CudaGraphModule, TensorDictModule
 
 from torchrl.data import LazyTensorStorage, ReplayBuffer
 
-from irl.swil import SWILDiscriminator, SWILPotDiscriminator, SwilReward
-from irl.utils import load_hf_demos, prepare_batch_update_irl, demos_gen_dict
+from irl.pwil import PWILReward
+from irl.utils import load_hf_demos
 
 
 @dataclass
@@ -35,6 +34,9 @@ class Args:
     torch_deterministic: bool = True
     cuda: bool = True
     capture_video: bool = False
+    track: bool = False
+    wandb_project_name: str = "sac_pwil"
+    wandb_entity: Optional[str] = None
 
     # Algorithm specific arguments
     env_id: str = "HalfCheetah-v4"
@@ -55,85 +57,33 @@ class Args:
     cudagraphs: bool = True
     measure_burnin: int = 3
 
-    # SWIL / IRL specific
+    # PWIL specific
     demo_dir: str = "./demos"
     n_demos: int = 10
     subsample: int = 1
-    normalize_irl_rewards: bool = False
-    swil_period: int = 100
-
-    # Discriminator architecture/behavior
     use_actions: bool = True
-    use_dones: bool = False
-    use_next_obs: bool = False
-    d_layer_dims: List[int] = field(default_factory=lambda: [128, 128])
-    disc_lr: float = 3e-4
-    scheduler_gamma: float = 1.0
-    gsw_df: str = "nn"  # nn/poly/linear/circular
-    swil_reward_type: str = "linear"
-    radon_df_type: str = "poly"
-    sw_poly_deg: int = 2
-    max_gsw: bool = False
-    n_proj: int = 1
-    swil_loss: str = "surr_loss"  # surr_loss/approx_sw/atom_gsw
-    swil_rew: str = "repl_loss"  # old_swil/replacement_nn/insertion_loss
-    repl_loss_type: str = "diff2"  # diff/diffmax0/diff2/diff2max0/diff3
-    swil_vb: int = 0
-    swil_ae: bool = False
-    vb_coeff: float = 0.0
-    i_c: float = 0.1
-    min_beta: float = 1.0
-    max_q_len: int = 1
-    max_swil_step: int = 100_000_000
-    replace_atoms: bool = False
-    aligned_index: bool = False
-    shuffle_irl_batches: bool = False
-    shuffle_atom_batches: bool = False
-    add_proj_noise: bool = False
-    use_cnn_base: bool = False
-    linear_proj: bool = False
-    proj_layer: bool = False
-    use_disc_bias: bool = True
-    use_weight_norm: bool = False
-    use_spectral_norm: bool = False
-    use_ll_weight_norm: bool = False
-    disc_nonlin: str = "tanh"  # relu/leakyrelu/prelu/tanh/id
-    irm_coeff: float = 0.0
-    lip_coeff: float = 0.0
-    lip_p: float = 1.0
-    l2_coeff: float = 0.0
-    proj_norm_coeff: float = 0.0
-    irl_epochs: int = 1
-    irl_init_epochs: int = 1
-    warmup_irl: bool = False
-    drop_batch: bool = False
-    # compatibility flags used by IRL utils
-    on_policy: bool = False
-    # New buffer-based SWIL implementation switch and options
-    swil_impl: str = "old"  # 'old' (discriminator) or 'new' (buffer-based SR/DUAL/RPL) or 'pot' (potential-based)
-    swil_variant: str = "SR"  # SR | DUAL | RPL (only for swil_impl='new')
-    swil_agg: str = "mean"  # mean | softmax | max
-    swil_tau: float = 0.5
-    swil_qgrid: int = 1024
+    pwil_alpha: float = 5.0
+    pwil_beta: float = 5.0
+    random_offset: int = 1
+    normalize_obs: bool = False
+    clip_action: bool = False
 
     # Checkpoint / evaluation
-    wandb_entity: str = None
-
-    save_video: bool = False
-    save_video_length: int = 1000
     save_dir: str = "checkpoints"
     save_interval: int = 100000
     eval: bool = False
-    load_path: str = ""
-    disc_load_path: str = ""
+    load_path: Optional[str] = None
     eval_episodes: int = 10
     # Demo saving (eval)
     save_demo: bool = False
-    demo_dir: str = "demos"
-    demo_out: str = ""
+    demo_dir_eval: str = "demos"
+    demo_out: Optional[str] = None
+    # Checkpoint video capture
+    save_video: bool = False
+    save_video_length: int = 1000
 
 
-def make_env(args, env_id, seed, idx, capture_video, run_name, disc=None, demos=None):
+def make_env(args, env_id, seed, idx, capture_video, run_name, demos):
     def thunk():
         env = gym.make(
             env_id, render_mode="rgb_array" if capture_video and idx == 0 else None
@@ -141,20 +91,16 @@ def make_env(args, env_id, seed, idx, capture_video, run_name, disc=None, demos=
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        if args.swil_impl == "old" or args.swil_impl == "pot":
-            if disc is not None:
-                env = SwilReward(env, args, disc)
-                if args.normalize_irl_rewards:
-                    env = gym.wrappers.NormalizeReward(env, gamma=args.gamma)
-                    env = gym.wrappers.TransformReward(
-                        env, lambda r: np.clip(r, -10, 10)
-                    )
-        else:
-            # Use new buffer-based reward implementation
-            env = SwilRewardNew(env, args, demos)
-            if args.normalize_irl_rewards:
-                env = gym.wrappers.NormalizeReward(env, gamma=args.gamma)
-                env = gym.wrappers.TransformReward(env, lambda r: np.clip(r, -10, 10))
+
+        env = PWILReward(env, args, demos)
+        if args.clip_action and isinstance(env.action_space, gym.spaces.Box):
+            env = gym.wrappers.ClipAction(env)
+        if args.normalize_obs and isinstance(env.observation_space, gym.spaces.Box):
+            env = gym.wrappers.NormalizeObservation(env)
+            env = gym.wrappers.TransformObservation(
+                env, lambda obs: np.clip(obs, -10, 10)
+            )
+
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
@@ -232,45 +178,16 @@ class Actor(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{args.compile}__{args.cudagraphs}"
 
-    # Create timestamp
-    from datetime import datetime
-    import dataclasses
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Track non-default args: where CLI values differ from dataclass defaults
-    default_args = Args()
-    non_default = {}
-    for field in dataclasses.fields(Args):
-        current_val = getattr(args, field.name)
-        default_val = getattr(default_args, field.name)
-        if current_val != default_val:
-            non_default[field.name] = current_val
-
-    # Format non-default args into string (similar to cleanrl)
-    non_default_str = (
-        str(non_default)
-        .replace(" ", "")
-        .replace(":", "")
-        .replace("{", "")
-        .replace("}", "")
-        .replace("'", "_")
-        .replace(",", "_")
-    )
-
-    run_name = (
-        f"{ts}__{args.exp_name}__{args.env_id}__seed{args.seed}__{non_default_str}"
-    )
-    if len(run_name) > 220:
-        run_name = run_name[:220]
-
-    wandb.init(
-        project="sac_swil",
-        name=run_name,
-        config=vars(args),
-        save_code=True,
-    )
+    if args.track:
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            name=f"{os.path.splitext(os.path.basename(__file__))[0]}-{run_name}",
+            config=vars(args),
+            save_code=True,
+        )
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -279,31 +196,11 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # Load expert demos (all variants consolidated)
+    # Load expert demos
     demos = load_hf_demos(args, n_demos=args.n_demos)
     demos_all = demos["all"]
 
-    # Create a single env for discriminator shape init
-    shape_env = gym.make(args.env_id)
-    if args.swil_impl == "pot":
-        disc = SWILPotDiscriminator(shape_env, args).to(device)
-        disc.d_optimizer = optim.Adam(
-            disc.parameters(),
-            lr=args.disc_lr,
-            weight_decay=args.l2_coeff,
-            capturable=args.cudagraphs,
-        )
-    else:
-        disc = SWILDiscriminator(shape_env, args)
-        # Ensure discriminator optimizer supports CUDA graph capture when requested
-        disc.d_optimizer = optim.Adam(
-            disc.parameters(),
-            lr=args.disc_lr,
-            weight_decay=args.l2_coeff,
-            capturable=args.cudagraphs and not args.compile,
-        )
-
-    # env setup (vectorized with IRL reward wrapper)
+    # env setup (vectorized with PWIL reward wrapper)
     envs = gym.vector.SyncVectorEnv(
         [
             make_env(
@@ -313,7 +210,6 @@ if __name__ == "__main__":
                 0,
                 args.capture_video,
                 run_name,
-                disc if args.swil_impl in ["old", "pot"] else None,
                 demos_all,
             )
         ]
@@ -427,40 +323,15 @@ if __name__ == "__main__":
             alpha_loss=alpha_loss.detach(),
         )
 
-    # Discriminator update (compilable + cudagraph-eligible)
-    def update_disc(ud):
-        loss_dict = disc.compute_loss(ud)
-        total_loss = (
-            loss_dict["d_loss"]
-            + args.irm_coeff * loss_dict["grad_penalty"]
-            + args.vb_coeff * loss_dict["ib_loss"]
-        )
-        disc.d_optimizer.zero_grad()
-        if args.swil_loss != "approx_sw":
-            total_loss.backward()
-        disc.d_optimizer.step()
-        return TensorDict(
-            d_loss=loss_dict["d_loss"].detach(),
-            grad_penalty=torch.as_tensor(loss_dict["grad_penalty"]).detach()
-            if isinstance(loss_dict["grad_penalty"], torch.Tensor)
-            else torch.zeros_like(loss_dict["d_loss"]).detach() * 0.0,
-            ib_loss=torch.as_tensor(loss_dict["ib_loss"]).detach()
-            if isinstance(loss_dict["ib_loss"], torch.Tensor)
-            else torch.zeros_like(loss_dict["d_loss"]).detach() * 0.0,
-        )
-
     if args.compile:
         mode = None
         update_main = torch.compile(update_main, mode=mode)
         update_pol = torch.compile(update_pol, mode=mode)
         policy = torch.compile(policy, mode=mode)
-        if args.swil_impl != "pot":
-            update_disc = torch.compile(update_disc, mode=mode)
 
     if args.cudagraphs:
         update_main = CudaGraphModule(update_main, in_keys=[], out_keys=[])
         update_pol = CudaGraphModule(update_pol, in_keys=[], out_keys=[])
-        # update_disc will be captured manually below once we see a first batch.
 
     # Eval helpers: load and evaluate actor
     def load_actor(weights_path: str):
@@ -468,24 +339,9 @@ if __name__ == "__main__":
         actor.load_state_dict(state)
         actor.eval()
 
-    def load_disc(weights_path: str):
-        state = torch.load(weights_path, map_location=device)
-        disc.load_state_dict(state)
-        disc.eval()
-
-    def evaluate_policy(n_episodes: int, use_swil_wrapper: bool = False) -> float:
+    def evaluate_policy(n_episodes: int) -> float:
         base_env = gym.vector.SyncVectorEnv(
-            [
-                make_env(
-                    args,
-                    args.env_id,
-                    args.seed,
-                    0,
-                    False,
-                    run_name,
-                    disc if use_swil_wrapper else None,
-                )
-            ]
+            [make_env(args, args.env_id, args.seed, 0, False, run_name, demos_all)]
         )
         ep_returns = []
         obs_buf, acs_buf, rew_buf, done_buf = [], [], [], []
@@ -509,13 +365,13 @@ if __name__ == "__main__":
         base_env.close()
         avg_ret = float(np.mean(ep_returns)) if ep_returns else 0.0
         if args.save_demo:
-            import os, numpy as np, pickle
+            import pickle
 
-            os.makedirs(args.demo_dir, exist_ok=True)
+            os.makedirs(args.demo_dir_eval, exist_ok=True)
             out_path = (
                 args.demo_out
                 if args.demo_out
-                else os.path.join(args.demo_dir, f"demo_hf_{args.env_id}_policy.pkl")
+                else os.path.join(args.demo_dir_eval, f"demo_hf_{args.env_id}_policy.pkl")
             )
             demo = {
                 "obs": np.asarray(obs_buf, dtype=np.float32),
@@ -539,10 +395,7 @@ if __name__ == "__main__":
             "Provide a valid --load_path for eval"
         )
         load_actor(args.load_path)
-        use_irl = bool(args.disc_load_path) and os.path.isfile(args.disc_load_path)
-        if use_irl:
-            load_disc(args.disc_load_path)
-        avg_ret = evaluate_policy(args.eval_episodes, use_swil_wrapper=use_irl)
+        avg_ret = evaluate_policy(args.eval_episodes)
         print(f"Eval average return over {args.eval_episodes} episodes: {avg_ret:.2f}")
         raise SystemExit(0)
 
@@ -566,62 +419,17 @@ if __name__ == "__main__":
                     break
         env.close()
 
-    obs, _ = envs.reset(seed=args.seed)
-
     # Main loop
+    obs, _ = envs.reset(seed=args.seed)
     obs = torch.as_tensor(obs, dtype=torch.float)
     pbar = tqdm.tqdm(range(args.total_timesteps))
     start_time = None
-    max_ep_ret, max_ep_ret_irl = -float("inf"), -float("inf")
+    max_ep_ret = -float("inf")
     avg_returns = deque(maxlen=20)
-    avg_irl_returns = deque(maxlen=20)
     desc = ""
-    init_disc_training = True  # Flag for initial discriminator training
-    disc_graph = None
-    disc_buffers = None
 
     os.makedirs(args.save_dir, exist_ok=True)
-
-    # Seed IRL: take a short random rollout and warm up discriminator projections
-    if args.n_proj == 1 and args.warmup_irl:
-        b_obs, b_acs, b_dones = [], [], []
-        for _ in range(args.batch_size):
-            rand_actions = np.array(
-                [envs.single_action_space.sample() for _ in range(envs.num_envs)]
-            )
-            next_obs, _, terminations, truncations, _ = envs.step(rand_actions)
-            dones = terminations | truncations
-            b_obs.append(torch.tensor(next_obs, dtype=torch.get_default_dtype()))
-            b_acs.append(torch.tensor(rand_actions, dtype=torch.get_default_dtype()))
-            b_dones.append(torch.tensor(dones, dtype=torch.get_default_dtype()))
-
-        if b_obs:
-            b_obs = torch.stack(b_obs)
-            b_acs = torch.stack(b_acs)
-            b_dones = torch.stack(b_dones)
-
-            gen_demos = demos_gen_dict(demos_all, args.batch_size)
-            for d in gen_demos:
-                if len(d["obs"]) < args.batch_size:
-                    if args.drop_batch:
-                        continue
-                    obs_ = b_obs[: len(d["obs"])]
-                    actions_ = b_acs[: len(d["obs"])]
-                    dones_ = b_dones[: len(d["obs"])]
-                else:
-                    obs_ = b_obs
-                    actions_ = b_acs
-                    dones_ = b_dones
-
-                ud_warm = prepare_batch_update_irl(
-                    envs, args, d, obs_, actions_, dones_, actor
-                )
-                _ = update_disc(ud_warm)
-
     for global_step in pbar:
-        irl_trigger = False
-
-        # measure time after burn-in
         if global_step == args.measure_burnin + args.learning_starts:
             start_time = time.time()
             measure_burnin = global_step
@@ -640,17 +448,10 @@ if __name__ == "__main__":
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         if "episode" in infos:
-            irl_trigger = True  # Trigger discriminator update on episode completion
             for r in infos["episode"]["r"][infos["episode"]["_r"]]:
                 max_ep_ret = max(max_ep_ret, r)
                 avg_returns.append(r)
-            for r in infos["episode"]["ep_rew_irl"]:
-                max_ep_ret_irl = max(max_ep_ret_irl, r)
-                avg_irl_returns.append(r)
-            desc = (
-                f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f}),"
-                f"episodic_return_irl={torch.tensor(avg_irl_returns).mean(): 4.2f} (max={max_ep_ret_irl: 4.2f})"
-            )
+            desc = f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f})"
 
         next_obs = torch.as_tensor(next_obs, device=device, dtype=torch.float)
         real_next_obs = next_obs.clone()
@@ -660,14 +461,13 @@ if __name__ == "__main__":
                     real_next_obs[idx] = torch.as_tensor(
                         final_obs, device=device, dtype=torch.float
                     )
-
         transition = TensorDict(
             observations=obs,
             next_observations=real_next_obs,
             actions=torch.as_tensor(actions, device=device, dtype=torch.float),
             rewards=torch.as_tensor(rewards, device=device, dtype=torch.float),
             terminations=terminations,
-            dones=terminations or truncations,
+            dones=terminations,
             batch_size=obs.shape[0],
             device=device,
         )
@@ -688,115 +488,40 @@ if __name__ == "__main__":
             if global_step % args.target_network_frequency == 0:
                 qnet_target.lerp_(qnet_params.data, args.tau)
 
-            # Discriminator update using the SAME data batch that SAC just trained on
-            # Determine when to update discriminator
-            irl_condition = global_step % args.swil_period == 0
-            if args.swil_period == -1:
-                # When swil_period is -1, trigger on episode completion
-                irl_condition = irl_trigger
-
-            if irl_condition and global_step < args.max_swil_step:
-                # Use irl_init_epochs initially, then irl_epochs
-                if init_disc_training:
-                    n_irl_epochs = args.irl_init_epochs
-                else:
-                    n_irl_epochs = args.irl_epochs
-                init_disc_training = False  # Only use init_epochs once
-                for _ in range(n_irl_epochs):
-                    gen_demos = demos_gen_dict(
-                        demos_all,
-                        args.batch_size,
-                        shuffle=args.shuffle_irl_batches,
-                        drop_last=False,
-                    )
-
-                    for d in gen_demos:
-                        # Use full data batch
-                        obs_ = data["observations"]
-                        actions_ = data["actions"]
-                        dones_ = data["dones"]
-
-                        ud = prepare_batch_update_irl(
-                            envs,
-                            args,
-                            d,
-                            obs_,
-                            actions_,
-                            dones_,
-                            actor,
-                        )
-                        if args.cudagraphs:
-                            # SWIL demo batches can vary in size; recapture if shapes differ
-                            if disc_graph is None or any(
-                                disc_buffers[k].shape != ud[k].shape for k in ud
-                            ):
-                                disc_buffers = {k: v.clone() for k, v in ud.items()}
-                                disc_graph = torch.cuda.make_graphed_callables(
-                                    update_disc, (disc_buffers,)
-                                )
-                                out_disc = disc_graph(disc_buffers)
-                            else:
-                                for k in disc_buffers:
-                                    disc_buffers[k].copy_(ud[k])
-                                out_disc = disc_graph(disc_buffers)
-                        else:
-                            out_disc = update_disc(ud)
-
-                if global_step % 100 == 0:
-                    wandb.log(
-                        {
-                            "irl/d_loss": out_disc["d_loss"].mean().item(),
-                            "irl/ib_loss": out_disc.get("ib_loss", torch.tensor(0.0))
-                            .mean()
-                            .item(),
-                            "irl/grad_penalty": out_disc.get(
-                                "grad_penalty", torch.tensor(0.0)
-                            )
-                            .mean()
-                            .item(),
-                        },
-                        step=global_step,
-                    )
-
             if args.save_interval and global_step % args.save_interval == 0:
                 ckpt_actor = os.path.join(
                     args.save_dir, f"{run_name}_actor_step{global_step}.pt"
                 )
                 torch.save(actor.state_dict(), ckpt_actor)
-                wandb.save(ckpt_actor, policy="now")
-                ckpt_disc = os.path.join(
-                    args.save_dir, f"{run_name}_disc_step{global_step}.pt"
-                )
-                torch.save(disc.state_dict(), ckpt_disc)
-                wandb.save(ckpt_disc, policy="now")
+                if args.track:
+                    wandb.save(ckpt_actor, policy="now")
                 record_checkpoint_video(global_step)
             if global_step % 100 == 0 and start_time is not None:
                 speed = (global_step - measure_burnin) / (time.time() - start_time)
                 pbar.set_description(f"{speed: 4.4f} sps, " + desc)
-                with torch.no_grad():
-                    logs = {
-                        "episode_return": torch.tensor(avg_returns).mean(),
-                        "actor_loss": out_main.get(
-                            "actor_loss", torch.tensor(0.0)
-                        ).mean(),
-                        "alpha_loss": out_main.get("alpha_loss", torch.tensor(0.0)),
-                        "qf_loss": out_main["qf_loss"].mean(),
-                    }
-                wandb.log(
-                    {
-                        "speed": speed,
-                        **{
-                            k: (v.item() if isinstance(v, torch.Tensor) else v)
-                            for k, v in logs.items()
+                if args.track:
+                    with torch.no_grad():
+                        logs = {
+                            "episode_return": torch.tensor(avg_returns).mean(),
+                            "actor_loss": out_main.get(
+                                "actor_loss", torch.tensor(0.0)
+                            ).mean(),
+                            "alpha_loss": out_main.get("alpha_loss", torch.tensor(0.0)),
+                            "qf_loss": out_main["qf_loss"].mean(),
+                        }
+                    wandb.log(
+                        {
+                            "speed": speed,
+                            **{
+                                k: (v.item() if isinstance(v, torch.Tensor) else v)
+                                for k, v in logs.items()
+                            },
                         },
-                    },
-                    step=global_step,
-                )
+                        step=global_step,
+                    )
 
     envs.close()
     final_path = os.path.join(args.save_dir, f"{run_name}_actor_final.pt")
     torch.save(actor.state_dict(), final_path)
-    wandb.save(final_path, policy="now")
-    final_disc = os.path.join(args.save_dir, f"{run_name}_disc_final.pt")
-    torch.save(disc.state_dict(), final_disc)
-    wandb.save(final_disc, policy="now")
+    if args.track:
+        wandb.save(final_path, policy="now")

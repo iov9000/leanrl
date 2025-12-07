@@ -1,28 +1,42 @@
+from __future__ import annotations
+
+from argparse import Namespace
+from typing import Dict, Mapping, Tuple
+
 import gymnasium as gym
 import numpy as np
 import torch
+import torch.autograd as autograd
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.autograd as autograd
-from torch.optim import Adam
 from torch.nn.utils import spectral_norm, weight_norm
-from irl.utils import MiniGridCNN, AtariCNNBase
+from torch.optim import Adam
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+TensorDict = Mapping[str, torch.Tensor]
+
+def layer_init(
+    layer: nn.Linear, std: float = np.sqrt(2), bias_const: float = 0.0
+) -> nn.Linear:
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
-def linlayer(in_dim, out_dim, bias=True, wnorm=False, snorm=False):
+def linlayer(
+    in_dim: int,
+    out_dim: int,
+    bias: bool = True,
+    wnorm: bool = False,
+    snorm: bool = False,
+) -> nn.Linear:
     if wnorm:
-        return weight_norm(nn.Linear(in_dim, out_dim, bias=bias), 'weight')
+        return weight_norm(nn.Linear(in_dim, out_dim, bias=bias), "weight")
     elif snorm:
-        return spectral_norm(nn.Linear(in_dim, out_dim, bias=bias), 'weight')
+        return spectral_norm(nn.Linear(in_dim, out_dim, bias=bias), "weight")
     else:
         return nn.Linear(in_dim, out_dim, bias=bias)
 
 class GAILDiscriminator(nn.Module):
-    def __init__(self, env, args):
+    def __init__(self, env: gym.Env, args: Namespace) -> None:
         super(GAILDiscriminator, self).__init__()
 
         self.env = env
@@ -35,9 +49,7 @@ class GAILDiscriminator(nn.Module):
         self.irm_coeff = args.irm_coeff
         self.l2_coeff = args.l2_coeff
         self.lip_coeff = args.lip_coeff
-        self.use_cnn_base = args.use_cnn_base
         self.bias = args.use_disc_bias
-        self.is_atari = 'atari' in args.exp_name.lower() if hasattr(args, 'exp_name') else False
         self.snorm = args.use_spectral_norm
         self.wnorm = args.use_weight_norm
 
@@ -83,37 +95,51 @@ class GAILDiscriminator(nn.Module):
         
         layer_dims = self.layer_dims
 
-        if self.is_atari:
-            self.base = AtariCNNBase(args, env, self.use_actions)
-            self.discriminator = nn.Linear(512, 1, bias=self.bias)
-        else:
-            if self.use_cnn_base:
-                self.base = MiniGridCNN(layer_dims, self.use_actions)
-            else:
-                self.base = nn.Sequential(linlayer(self.layer_dims[0], self.layer_dims[1], 
-                                                    self.bias, self.wnorm, self.snorm),
-                                        nonlin)
+        self.base = nn.Sequential(
+            linlayer(
+                self.layer_dims[0],
+                self.layer_dims[1],
+                self.bias,
+                self.wnorm,
+                self.snorm,
+            ),
+            nonlin,
+        )
 
-            self.discriminator_layers = []
-            for i in range(2, len(layer_dims)):
-                self.discriminator_layers += [linlayer(in_dim=layer_dims[i - 1],
-                                                            out_dim=layer_dims[i],
-                                                            bias=self.bias,
-                                                            wnorm=self.wnorm,
-                                                            snorm=self.snorm),
-                                            nonlin]
+        self.discriminator_layers = []
+        for i in range(2, len(layer_dims)):
+            self.discriminator_layers += [
+                linlayer(
+                    in_dim=layer_dims[i - 1],
+                    out_dim=layer_dims[i],
+                    bias=self.bias,
+                    wnorm=self.wnorm,
+                    snorm=self.snorm,
+                ),
+                nonlin,
+            ]
 
-            self.discriminator_layers += [linlayer(in_dim=layer_dims[-1],
-                                                   out_dim=1,
-                                                        bias=self.bias,
-                                                        wnorm=self.wnorm,
-                                                        snorm=self.snorm)]
+        self.discriminator_layers += [
+            linlayer(
+                in_dim=layer_dims[-1],
+                out_dim=1,
+                bias=self.bias,
+                wnorm=self.wnorm,
+                snorm=self.snorm,
+            )
+        ]
 
-            self.discriminator = nn.Sequential(*self.discriminator_layers)
+        self.discriminator = nn.Sequential(*self.discriminator_layers)
 
         self.d_optimizer = Adam(self.parameters(), lr=self.lr, weight_decay=self.l2_coeff)
 
-    def base_fwd(self, ob, ac, nob=None, d=None):
+    def base_fwd(
+        self,
+        ob: torch.Tensor,
+        ac: torch.Tensor | None,
+        nob: torch.Tensor | None = None,
+        d: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         #  match tensor sizes
         if ac is not None:
             if len(ob.shape) != len(ac.shape):
@@ -129,15 +155,17 @@ class GAILDiscriminator(nn.Module):
         if self.use_dones:
             input_.append(d)
 
-        if (self.use_cnn_base or self.is_atari):
-            base_out = self.base(*input_)
-
-        else:
-            base_out = self.base(torch.cat(input_, axis=-1))
+        base_out = self.base(torch.cat(input_, axis=-1))
 
         return base_out
 
-    def forward(self, ob, ac=None, nob=None, d=None):
+    def forward(
+        self,
+        ob: torch.Tensor,
+        ac: torch.Tensor | None = None,
+        nob: torch.Tensor | None = None,
+        d: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         base_out = self.base_fwd(ob, ac, nob, d)
 
         d_out = self.discriminator(base_out)
@@ -154,7 +182,13 @@ class GAILDiscriminator(nn.Module):
 
         return d_out_
 
-    def get_reward(self, ob, ac, nob=None, d=None):
+    def get_reward(
+        self,
+        ob: torch.Tensor,
+        ac: torch.Tensor | None,
+        nob: torch.Tensor | None = None,
+        d: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         base_out = self.base_fwd(ob, ac, nob, d)
 
         d_out = self.discriminator(base_out)
@@ -172,13 +206,17 @@ class GAILDiscriminator(nn.Module):
         self.reward = reward.squeeze(-1)
         return self.reward
 
-    def irm_penalty(self, logits, y):
-        scale = torch.tensor(1., device=logits.device).requires_grad_()
+    def irm_penalty(
+        self, logits: torch.Tensor, y: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        scale = torch.tensor(1.0, device=logits.device).requires_grad_()
         loss = F.binary_cross_entropy_with_logits(logits * scale, y)
         grad = autograd.grad(loss, [scale], create_graph=True)[0]
         return torch.sum(grad ** 2), grad
 
-    def lip_penalty(self, update_dict, p=1):
+    def lip_penalty(
+        self, update_dict: TensorDict, p: float = 1
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
         policy_obs = update_dict['policy_obs']
         policy_acs = update_dict['policy_acs']
         policy_obs_next = update_dict['policy_obs_next']
@@ -248,7 +286,7 @@ class GAILDiscriminator(nn.Module):
         gradient_mix = torch.cat(grads_flat, dim=1)
         return gradient_mag, gradient_mix
 
-    def compute_loss(self, update_dict):
+    def compute_loss(self, update_dict: TensorDict) -> Dict[str, torch.Tensor]:
         self.policy_obs = update_dict['policy_obs']
         self.policy_acs = update_dict['policy_acs']
         policy_obs_next = update_dict['policy_obs_next']
@@ -301,7 +339,7 @@ class GAILDiscriminator(nn.Module):
 
         return output_dict
         
-    def update(self, loss):
+    def update(self, loss: torch.Tensor) -> None:
         self.d_optimizer.zero_grad()
         loss.backward()
         self.d_optimizer.step()

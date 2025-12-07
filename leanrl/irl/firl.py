@@ -1,28 +1,42 @@
+from __future__ import annotations
+
+from argparse import Namespace
+from typing import Dict, Mapping, Tuple
+
 import gymnasium as gym
 import numpy as np
 import torch
+import torch.autograd as autograd
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.autograd as autograd
-from torch.optim import Adam
 from torch.nn.utils import spectral_norm, weight_norm
-from leanrl.irl.utils import MiniGridCNN
+from torch.optim import Adam
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+TensorDict = Mapping[str, torch.Tensor]
+
+def layer_init(
+    layer: nn.Linear, std: float = np.sqrt(2), bias_const: float = 0.0
+) -> nn.Linear:
     torch.nn.init.orthogonal_(layer.weight, std)
     # torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
-def linlayer(in_dim, out_dim, bias=True, wnorm=False, snorm=False):
+def linlayer(
+    in_dim: int,
+    out_dim: int,
+    bias: bool = True,
+    wnorm: bool = False,
+    snorm: bool = False,
+) -> nn.Linear:
     if wnorm:
-        return weight_norm(nn.Linear(in_dim, out_dim, bias=bias), 'weight')
+        return weight_norm(nn.Linear(in_dim, out_dim, bias=bias), "weight")
     elif snorm:
-        return spectral_norm(nn.Linear(in_dim, out_dim, bias=bias), 'weight')
+        return spectral_norm(nn.Linear(in_dim, out_dim, bias=bias), "weight")
     else:
         return nn.Linear(in_dim, out_dim, bias=bias)
 
 class fIRLDiscriminator(nn.Module):
-    def __init__(self, env, args):
+    def __init__(self, env: gym.Env, args: Namespace) -> None:
         super().__init__()
 
         self.env = env
@@ -35,7 +49,6 @@ class fIRLDiscriminator(nn.Module):
         self.irm_coeff = args.irm_coeff
         self.l2_coeff = args.l2_coeff
         self.lip_coeff = args.lip_coeff
-        self.use_cnn_base = args.use_cnn_base
         self.bias = args.use_disc_bias
         self.is_atari = False # 'atari' in self.args.exp_name
         self.snorm = False # args.use_spectral_norm
@@ -73,13 +86,10 @@ class fIRLDiscriminator(nn.Module):
         self.layer_dims = [dim0] + list(self.layer_dims)
         
         # reward function g_\psi
-        if self.use_cnn_base:
-            self.base = MiniGridCNN(self.layer_dims, self.use_actions)
-        else:
-            self.base = nn.Sequential(
-                linlayer(self.layer_dims[0], self.layer_dims[1], self.bias),
-                nn.ReLU()
-            )
+        self.base = nn.Sequential(
+            linlayer(self.layer_dims[0], self.layer_dims[1], self.bias),
+            nn.ReLU()
+        )
 
         self.reward_layers = []
         for i in range(2, len(self.layer_dims)):
@@ -94,13 +104,10 @@ class fIRLDiscriminator(nn.Module):
         self.reward = nn.Sequential(*self.reward_layers)
 
         # shaping function h_\phi
-        if self.use_cnn_base:
-            self.base_v = MiniGridCNN(self.layer_dims, use_actions=False)
-        else:
-            self.base_v = nn.Sequential(
-                linlayer(self.layer_dims[0], self.layer_dims[1], self.bias),
-                nn.Tanh()
-            )
+        self.base_v = nn.Sequential(
+            linlayer(self.layer_dims[0], self.layer_dims[1], self.bias),
+            nn.Tanh()
+        )
 
         self.disc_layers = []
         for i in range(2, len(self.layer_dims)):
@@ -119,16 +126,20 @@ class fIRLDiscriminator(nn.Module):
         self.d_optimizer = Adam(list(self.base_v.parameters()) +  list(self.disc.parameters()), lr=self.lr, 
                                 weight_decay=self.l2_coeff)
 
-    def forward(self, ob, next_ob, ac, lprobs):
+    def forward(
+        self,
+        ob: torch.Tensor,
+        next_ob: torch.Tensor,
+        ac: torch.Tensor,
+        lprobs: torch.Tensor,
+    ) -> torch.Tensor:
         # forward the nn models
         reward = self.get_reward(ob, ac)
         reward = torch.clamp(reward, min=-1.0*self.clamp_magnitude, max=self.clamp_magnitude)
         return reward
 
-    def disc_forward(self, ob, ac):
-        if self.use_actions and self.use_cnn_base:
-            base_out = self.base_v(ob, ac)
-        elif self.use_actions and not self.use_cnn_base:
+    def disc_forward(self, ob: torch.Tensor, ac: torch.Tensor) -> torch.Tensor:
+        if self.use_actions:
             base_out = self.base_v(torch.cat([ob, ac], axis=-1))
         else:
             base_out = self.base_v(ob)
@@ -136,10 +147,8 @@ class fIRLDiscriminator(nn.Module):
         d_out = self.disc(base_out)
         return d_out
 
-    def get_reward(self, ob, ac):
-        if self.use_actions and self.use_cnn_base:
-            base_out = self.base(ob, ac)
-        elif self.use_actions and not self.use_cnn_base:
+    def get_reward(self, ob: torch.Tensor, ac: torch.Tensor) -> torch.Tensor:
+        if self.use_actions:
             if len(ob.shape) != len(ac.shape):
                 ac = torch.unsqueeze(ac, -1)
             base_out = self.base(torch.cat([ob, ac], axis=-1))
@@ -150,13 +159,13 @@ class fIRLDiscriminator(nn.Module):
         reward = torch.clamp(reward, min=-1.0*self.clamp_magnitude, max=self.clamp_magnitude)
         return reward
 
-    def irm_penalty(self, logits, y):
-        scale = torch.tensor(1.).to(logits.device).requires_grad_()
+    def irm_penalty(self, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        scale = torch.tensor(1.0).to(logits.device).requires_grad_()
         loss = F.binary_cross_entropy_with_logits(logits * scale, y)
         grad = autograd.grad(loss, [scale], create_graph=True)[0]
         return torch.sum(grad ** 2)
 
-    def compute_loss(self, update_dict):
+    def compute_loss(self, update_dict: TensorDict) -> Dict[str, torch.Tensor]:
         reward_loss, norm_logits = self.f_div_disc_loss('rkl', False, update_dict)
 
         grad_penalty = 0
@@ -173,7 +182,7 @@ class fIRLDiscriminator(nn.Module):
         output_dict['grad_penalty'] = grad_penalty
         return output_dict
 
-    def update_disc(self, update_dict):
+    def update_disc(self, update_dict: TensorDict) -> torch.Tensor:
         d_out = self.disc_forward(update_dict['all_obs'], update_dict['all_acs'])
         expert_out, policy_out = torch.chunk(d_out, chunks=2, dim=0)
 
@@ -197,7 +206,9 @@ class fIRLDiscriminator(nn.Module):
 
         return loss
 
-    def f_div_disc_loss(self, div: str, IS: bool, update_dict):
+    def f_div_disc_loss(
+        self, div: str, IS: bool, update_dict: TensorDict
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert div in ['fkl', 'rkl', 'js']
         
         T = len(update_dict['all_obs'])
@@ -224,7 +235,7 @@ class fIRLDiscriminator(nn.Module):
 
         return surrogate_objective, t1.mean() 
 
-    def update(self, loss):
+    def update(self, loss: torch.Tensor) -> None:
         self.reward_optimizer.zero_grad()
         loss.backward()
         self.reward_optimizer.step()
