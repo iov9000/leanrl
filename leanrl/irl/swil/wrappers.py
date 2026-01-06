@@ -504,6 +504,9 @@ class SwilRewardNew(gym.Wrapper):
         # find insertion positions w.r.t. current sorted rows (trailing +inf)
         pos = torch.searchsorted(s, Z.unsqueeze(1), right=False).squeeze(1)
         pos = torch.minimum(pos, c)
+        # when full, searchsorted can return cap (out of bounds); clamp to last slot
+        max_pos = torch.where(c >= self.cap, c - 1, c)
+        pos = torch.minimum(pos, max_pos)
         idx = torch.arange(C, device=device).unsqueeze(0).expand(K, -1)
         # shift right region [pos, c) by one
         mask_shift = (idx > pos.unsqueeze(1)) & (idx <= c.unsqueeze(1))
@@ -553,6 +556,16 @@ class SwilRewardNew(gym.Wrapper):
         info["step"] = self.cnt
         self.cnt += 1
         self.traj.append(gt_reward)
+
+        device = self.exp_sorted.device
+        dtype = self.exp_sorted.dtype
+        if self.obs is not None:
+            obs_t = torch.as_tensor(self.obs, dtype=dtype, device=device)
+        else:
+            obs_t = torch.as_tensor(next_obs, dtype=dtype, device=device)
+        acs_t = torch.as_tensor(action, dtype=dtype, device=device)
+        next_obs_t = torch.as_tensor(next_obs, dtype=dtype, device=device)
+        done_t = torch.as_tensor(done, dtype=dtype, device=device)
 
         z = self._feats(obs_t, acs_t, next_obs_t, done_t)
         Znew = z @ self.dirs.t()  # [K]
