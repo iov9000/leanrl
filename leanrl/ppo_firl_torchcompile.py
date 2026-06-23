@@ -400,7 +400,7 @@ if __name__ == "__main__":
                 
                 for _ in range(args.firl_disc_iter):
                     update_dict = prepare_batch_update_irl(
-                        envs, args, d, obs_, actions_, dones_, agent
+                        envs, args, d, obs_, None, actions_, dones_, agent
                     )
                     discriminator.update_disc(update_dict)
 

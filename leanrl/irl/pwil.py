@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Sequence, Tuple
 import gymnasium as gym
 import numpy as np
 import ot
-from sklearn import preprocessing
 
 
 def get_trajectory_list_from_dict(demos: Dict[str, np.ndarray]) -> Dict[str, List[np.ndarray]]:
@@ -25,6 +24,10 @@ def get_trajectory_list_from_dict(demos: Dict[str, np.ndarray]) -> Dict[str, Lis
             traj_acs.append(ep_a)
             traj_rew.append(ep_r)
             ep_o, ep_a, ep_r = [], [], []
+    if ep_o:
+        traj_obs.append(ep_o)
+        traj_acs.append(ep_a)
+        traj_rew.append(ep_r)
 
     return {"obs": traj_obs, "acs": traj_acs, "rew": traj_rew}
 
@@ -65,14 +68,16 @@ class PWILRewarder:
         self.demonstrations = self.filter_demonstrations(
             get_trajectory_list_from_dict(demonstrations)
         )
+        obs_atoms = self._flatten_demonstrations(self.demonstrations["obs"], "obs")
 
         if self.observation_only:
             dim_demos = dim_obs
-            self.vectorized_demonstrations = self.demonstrations["obs"]
+            self.vectorized_demonstrations = obs_atoms
         else:
             dim_demos = dim_obs + dim_act
+            acs_atoms = self._flatten_demonstrations(self.demonstrations["acs"], "acs")
             self.vectorized_demonstrations = np.concatenate(
-                [self.demonstrations["obs"], self.demonstrations["acs"]], axis=-1
+                [obs_atoms, acs_atoms], axis=-1
             )
 
         self.vectorized_demonstrations = np.reshape(
@@ -84,11 +89,15 @@ class PWILRewarder:
             self.subsampling = 1
             self.random_offset = 0
             self.demonstrations = get_trajectory_list_from_dict(demonstrations)
+            obs_atoms = self._flatten_demonstrations(self.demonstrations["obs"], "obs")
             if self.observation_only:
-                self.vectorized_demonstrations = self.demonstrations["obs"]
+                self.vectorized_demonstrations = obs_atoms
             else:
+                acs_atoms = self._flatten_demonstrations(
+                    self.demonstrations["acs"], "acs"
+                )
                 self.vectorized_demonstrations = np.concatenate(
-                    [self.demonstrations["obs"], self.demonstrations["acs"]], axis=-1
+                    [obs_atoms, acs_atoms], axis=-1
                 )
             self.vectorized_demonstrations = np.reshape(
                 self.vectorized_demonstrations, [-1, dim_demos]
@@ -112,11 +121,27 @@ class PWILRewarder:
                 filtered[key].append(subsampled)
         return filtered
 
+    @staticmethod
+    def _flatten_demonstrations(
+        episodes: Sequence[Sequence[np.ndarray]], name: str
+    ) -> np.ndarray:
+        arrays = [
+            np.asarray(episode, dtype=np.float32)
+            for episode in episodes
+            if len(episode) > 0
+        ]
+        if not arrays:
+            return np.empty((0, 0), dtype=np.float32)
+        try:
+            return np.concatenate(arrays, axis=0)
+        except ValueError as exc:
+            raise ValueError(
+                f"PWIL {name} demonstrations have incompatible shapes"
+            ) from exc
+
     def get_scaler(self):
         """Defines a scaler to derive the standardized Euclidean distance."""
-        scaler = preprocessing.StandardScaler()
-        scaler.fit(self.vectorized_demonstrations)
-        return scaler
+        return _PWILNormalizer(self.vectorized_demonstrations)
 
     def reset(self) -> None:
         """Makes all expert transitions available and initialize weights."""
@@ -141,9 +166,6 @@ class PWILRewarder:
 
         agent_atom = np.expand_dims(agent_atom, axis=0)  # add dim for scaler
         agent_atom = self.scaler.transform(agent_atom)[0]
-
-        if len(self.expert_atoms) == 1:
-            self.reset()
 
         cost = 0.0
         weight = 1.0 / self.time_horizon - 1e-6
@@ -184,6 +206,19 @@ class PWILRewarder:
         return float(w2_dist)
 
 
+class _PWILNormalizer:
+    """Matches Kaixhin's expert-atom normalisation while handling zero variance."""
+
+    def __init__(self, atoms: np.ndarray) -> None:
+        self.mean = atoms.mean(axis=0, keepdims=True)
+        ddof = 1 if atoms.shape[0] > 1 else 0
+        scale = atoms.std(axis=0, ddof=ddof, keepdims=True)
+        self.scale = np.where(scale == 0, 1.0, scale)
+
+    def transform(self, atoms: np.ndarray) -> np.ndarray:
+        return (np.asarray(atoms, dtype=np.float32) - self.mean) / self.scale
+
+
 class PWILReward(gym.Wrapper):
     def __init__(
         self, env: gym.Env, opt: Namespace, demos: Dict[str, np.ndarray]
@@ -194,16 +229,30 @@ class PWILReward(gym.Wrapper):
         self.subsampling = getattr(opt, "subsampling", getattr(opt, "subsample", 1))
         self.episode_return = 0.0
         self.obs = None
+        time_horizon = float(getattr(opt, "pwil_time_horizon", 0.0))
+        if time_horizon <= 0.0:
+            env_spec = getattr(env, "spec", None)
+            time_horizon = float(getattr(env_spec, "max_episode_steps", None) or 1000.0)
         self.pwil = PWILRewarder(
             demos,
             subsampling=self.subsampling,
             env=env,
             num_demonstrations=self.n_demos,
+            time_horizon=time_horizon,
             observation_only=not self.use_actions,
             alpha=getattr(opt, "pwil_alpha", 5.0),
             beta=getattr(opt, "pwil_beta", 5.0),
             random_offset=getattr(opt, "random_offset", 1),
         )
+
+    def reset(
+        self, seed: int | None = None, options: Dict[str, Any] | None = None
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        obs, info = super().reset(seed=seed, options=options)
+        self.obs = obs
+        self.episode_return = 0.0
+        self.pwil.reset()
+        return obs, info
 
     def step(
         self, action: np.ndarray | int | float
@@ -213,8 +262,6 @@ class PWILReward(gym.Wrapper):
         obs = next_obs if self.obs is None else self.obs
         info["gt_reward"] = gt_reward
 
-        # Reset the PWIL atoms each step as in the reference implementation.
-        self.pwil.reset()
         if self.use_actions:
             reward = self.pwil.compute_reward(obs, action)
         else:
@@ -226,5 +273,6 @@ class PWILReward(gym.Wrapper):
             info.setdefault("episode", {})
             info["episode"]["ep_rew_irl"] = self.episode_return
             self.episode_return = 0.0
+            self.pwil.reset()
 
         return next_obs, reward, term, trunc, info

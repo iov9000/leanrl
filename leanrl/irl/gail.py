@@ -12,7 +12,34 @@ import torch.nn.functional as F
 from torch.nn.utils import spectral_norm, weight_norm
 from torch.optim import Adam
 
+try:
+    from leanrl.il_utils import (
+        compute_online_phases,
+        encode_phase_features,
+        phase_feature_dim,
+        validate_phase_mode,
+    )
+except ImportError:
+    from il_utils import (
+        compute_online_phases,
+        encode_phase_features,
+        phase_feature_dim,
+        validate_phase_mode,
+    )
+
 TensorDict = Mapping[str, torch.Tensor]
+
+
+def _resolve_phase_horizon(opt: Namespace, env: gym.Env | None = None) -> int:
+    explicit = int(getattr(opt, "imitation_time_horizon", 0))
+    if explicit > 0:
+        return explicit
+    if env is not None:
+        spec = getattr(env, "spec", None)
+        max_steps = getattr(spec, "max_episode_steps", None)
+        if max_steps is not None:
+            return int(max_steps)
+    return 1000
 
 def layer_init(
     layer: nn.Linear, std: float = np.sqrt(2), bias_const: float = 0.0
@@ -46,6 +73,8 @@ class GAILDiscriminator(nn.Module):
         self.use_actions = getattr(args, "use_actions", True)
         self.use_dones = getattr(args, "use_dones", False)
         self.use_next_obs = getattr(args, "use_next_obs", False)
+        self.phase_mode = validate_phase_mode(getattr(args, "imitation_phase_mode", "none"))
+        self.phase_dim = phase_feature_dim(self.phase_mode)
         self.irm_coeff = args.irm_coeff
         self.l2_coeff = args.l2_coeff
         self.lip_coeff = args.lip_coeff
@@ -87,6 +116,9 @@ class GAILDiscriminator(nn.Module):
             dim0 = dim0 + 1
         if self.use_next_obs:
             dim0 = dim0 + ob_shapes[-1]
+        dim0 = dim0 + self.phase_dim
+        if self.use_next_obs:
+            dim0 = dim0 + self.phase_dim
 
         self.layer_dims = [dim0] + self.layer_dims
         
@@ -139,6 +171,8 @@ class GAILDiscriminator(nn.Module):
         ac: torch.Tensor | None,
         nob: torch.Tensor | None = None,
         d: torch.Tensor | None = None,
+        phase: torch.Tensor | None = None,
+        next_phase: torch.Tensor | None = None,
     ) -> torch.Tensor:
         #  match tensor sizes
         if ac is not None:
@@ -148,12 +182,17 @@ class GAILDiscriminator(nn.Module):
             d = torch.unsqueeze(d, -1)
 
         input_ = [ob]
+        phase_features = encode_phase_features(phase, self.phase_mode)
         if self.use_actions:
             input_.append(ac)
         if self.use_next_obs:
             input_.append(nob)
+            if phase_features is not None:
+                input_.append(encode_phase_features(next_phase, self.phase_mode))
         if self.use_dones:
             input_.append(d)
+        if phase_features is not None:
+            input_.append(phase_features)
 
         base_out = self.base(torch.cat(input_, axis=-1))
 
@@ -165,8 +204,10 @@ class GAILDiscriminator(nn.Module):
         ac: torch.Tensor | None = None,
         nob: torch.Tensor | None = None,
         d: torch.Tensor | None = None,
+        phase: torch.Tensor | None = None,
+        next_phase: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        base_out = self.base_fwd(ob, ac, nob, d)
+        base_out = self.base_fwd(ob, ac, nob, d, phase, next_phase)
 
         d_out = self.discriminator(base_out)
 
@@ -188,8 +229,10 @@ class GAILDiscriminator(nn.Module):
         ac: torch.Tensor | None,
         nob: torch.Tensor | None = None,
         d: torch.Tensor | None = None,
+        phase: torch.Tensor | None = None,
+        next_phase: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        base_out = self.base_fwd(ob, ac, nob, d)
+        base_out = self.base_fwd(ob, ac, nob, d, phase, next_phase)
 
         d_out = self.discriminator(base_out)
 
@@ -221,10 +264,14 @@ class GAILDiscriminator(nn.Module):
         policy_acs = update_dict['policy_acs']
         policy_obs_next = update_dict['policy_obs_next']
         policy_dones = update_dict['policy_dones']
+        policy_phase = update_dict["policy_phase"]
+        policy_next_phase = update_dict["policy_next_phase"]
         exp_obs = update_dict['expert_obs']
         exp_acs = update_dict['expert_acs']
         exp_obs_next = update_dict['expert_obs_next']
         exp_dones = update_dict['expert_dones']
+        exp_phase = update_dict["expert_phase"]
+        exp_next_phase = update_dict["expert_next_phase"]
 
         # Handle mismatched batch sizes by subsampling the larger batch
         min_bs = min(policy_obs.shape[0], exp_obs.shape[0])
@@ -234,12 +281,16 @@ class GAILDiscriminator(nn.Module):
             policy_acs = policy_acs[idx]
             policy_obs_next = policy_obs_next[idx]
             policy_dones = policy_dones[idx]
+            policy_phase = policy_phase[idx]
+            policy_next_phase = policy_next_phase[idx]
         if exp_obs.shape[0] != min_bs:
             idx = torch.randperm(exp_obs.shape[0], device=exp_obs.device)[:min_bs]
             exp_obs = exp_obs[idx]
             exp_acs = exp_acs[idx]
             exp_obs_next = exp_obs_next[idx]
             exp_dones = exp_dones[idx]
+            exp_phase = exp_phase[idx]
+            exp_next_phase = exp_next_phase[idx]
 
         if len(exp_obs.shape) != len(exp_dones.shape):
             exp_dones = torch.unsqueeze(exp_dones, -1)
@@ -263,13 +314,17 @@ class GAILDiscriminator(nn.Module):
             interp_next_obs = nobs_epsilon * policy_obs_next + (1 - nobs_epsilon) * exp_obs_next
             interp_next_obs.requires_grad = True  # For gradient calculation
             input_.append(interp_next_obs)
+            interp_next_phase = 0.5 * (policy_next_phase + exp_next_phase)
+        else:
+            interp_next_phase = None
         if self.use_dones:
             d_epsilon = torch.rand(policy_dones.shape, device=policy_dones.device)
             interp_d = d_epsilon * policy_dones + (1 - d_epsilon) * exp_dones
             interp_d.requires_grad = True  # For gradient calculation
             input_.append(interp_d)
+        interp_phase = 0.5 * (policy_phase + exp_phase)
 
-        estimate = self.forward(*input_)
+        estimate = self.forward(*input_, phase=interp_phase, next_phase=interp_next_phase)
 
         grads = torch.autograd.grad(estimate.sum(), input_, create_graph=True)
         # Combine gradients from all inputs before computing the penalty
@@ -291,13 +346,31 @@ class GAILDiscriminator(nn.Module):
         self.policy_acs = update_dict['policy_acs']
         policy_obs_next = update_dict['policy_obs_next']
         policy_dones = update_dict['policy_dones']
+        policy_phase = update_dict["policy_phase"]
+        policy_next_phase = update_dict["policy_next_phase"]
         exp_obs = update_dict['expert_obs']
         exp_acs = update_dict['expert_acs']
         exp_obs_next = update_dict['expert_obs_next']
         exp_dones = update_dict['expert_dones']
+        exp_phase = update_dict["expert_phase"]
+        exp_next_phase = update_dict["expert_next_phase"]
 
-        policy_out = self.forward(self.policy_obs, self.policy_acs, policy_obs_next, policy_dones)
-        expert_out = self.forward(exp_obs, exp_acs, exp_obs_next, exp_dones)
+        policy_out = self.forward(
+            self.policy_obs,
+            self.policy_acs,
+            policy_obs_next,
+            policy_dones,
+            policy_phase,
+            policy_next_phase,
+        )
+        expert_out = self.forward(
+            exp_obs,
+            exp_acs,
+            exp_obs_next,
+            exp_dones,
+            exp_phase,
+            exp_next_phase,
+        )
 
         d_out = torch.cat([expert_out, policy_out])
 
@@ -348,11 +421,18 @@ class GailReward(gym.Wrapper):
     def __init__(self, env, disc):
         super().__init__(env=env)
         self.discriminator = disc
+        self.args = getattr(disc, "args", Namespace())
+        self.phase_mode = validate_phase_mode(
+            getattr(self.args, "imitation_phase_mode", "none")
+        )
+        self.phase_horizon = _resolve_phase_horizon(self.args, env)
         self.obs = None
+        self.step_index = 0
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self.obs = obs
+        self.step_index = 0
         return obs, info
 
     def step(self, action):
@@ -366,10 +446,29 @@ class GailReward(gym.Wrapper):
         acs_t = torch.tensor(action, dtype=torch.float32, device=next(self.discriminator.parameters()).device).unsqueeze(0)
         next_obs_t = torch.tensor(next_obs, dtype=torch.float32, device=next(self.discriminator.parameters()).device).unsqueeze(0)
         done_t = torch.tensor([done], dtype=torch.float32, device=next(self.discriminator.parameters()).device).unsqueeze(0)
+        phase_t = None
+        next_phase_t = None
+        if self.phase_mode != "none":
+            phase_t, next_phase_t = compute_online_phases(
+                torch.tensor(
+                    [self.step_index],
+                    dtype=torch.float32,
+                    device=obs_t.device,
+                ),
+                horizon=self.phase_horizon,
+                done=done_t.view(-1),
+            )
 
         with torch.no_grad():
             irl_reward = self.discriminator.get_reward(
-                obs_t, acs_t, next_obs_t, done_t).cpu().numpy()[0]
+                obs_t,
+                acs_t,
+                next_obs_t,
+                done_t,
+                phase=phase_t,
+                next_phase=next_phase_t,
+            ).cpu().numpy()[0]
 
         self.obs = next_obs
+        self.step_index = 0 if done else self.step_index + 1
         return next_obs, irl_reward, term, trunc, info

@@ -27,6 +27,20 @@ from torchrl.data import LazyTensorStorage, ReplayBuffer
 
 from irl.gail import GAILDiscriminator, GailReward
 from irl.utils import load_hf_demos, prepare_batch_update_irl
+try:
+    from leanrl.il_utils import (
+        augment_observations,
+        compute_online_phases,
+        phase_feature_dim,
+        validate_phase_mode,
+    )
+except ImportError:
+    from il_utils import (
+        augment_observations,
+        compute_online_phases,
+        phase_feature_dim,
+        validate_phase_mode,
+    )
 
 
 def prepare_batch_update_irl_gpu(
@@ -139,18 +153,18 @@ class Args:
     buffer_size: int = int(1e6)
     gamma: float = 0.99
     tau: float = 0.005
-    batch_size: int = 256
+    batch_size: int = 250
     learning_starts: int = 5_000
     policy_lr: float = 3e-4
     q_lr: float = 1e-3
     policy_frequency: int = 2
-    disc_period: int = 100  # -1 to update on episode completion
+    disc_period: int = 1  # -1 to update on episode completion
     target_network_frequency: int = 1
     alpha: float = 0.2
     autotune: bool = True
 
-    compile: bool = False
-    cudagraphs: bool = False
+    compile: bool = True
+    cudagraphs: bool = True
     measure_burnin: int = 3
 
     # GAIL / IRL specific
@@ -158,6 +172,9 @@ class Args:
     n_demos: int = 10
     subsample: int = 1
     normalize_irl_rewards: bool = False
+    imitation_phase_mode: str = "none"
+    imitation_time_horizon: int = 0
+    observation_phase_mode: str = "none"
     
     # Discriminator architecture/behavior
     use_actions: bool = True
@@ -288,6 +305,8 @@ class Actor(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    validate_phase_mode(args.imitation_phase_mode)
+    validate_phase_mode(args.observation_phase_mode)
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{args.compile}__{args.cudagraphs}"
 
     if args.track:
@@ -310,7 +329,7 @@ if __name__ == "__main__":
     demos = load_hf_demos(args, n_demos=args.n_demos)
     demos_all = demos["all"]
     # Convert demos to GPU tensors
-    for k in ["obs", "acs", "rew", "done"]:
+    for k in ["obs", "acs", "rew", "done", "phase", "next_phase", "next_obs"]:
         if k in demos_all:
             demos_all[k] = torch.as_tensor(demos_all[k], device=device, dtype=torch.float32)
 
@@ -340,9 +359,15 @@ if __name__ == "__main__":
         ]
     )
     n_act = math.prod(envs.single_action_space.shape)
-    n_obs = math.prod(envs.single_observation_space.shape)
+    base_obs_dim = math.prod(envs.single_observation_space.shape)
+    n_obs = base_obs_dim + phase_feature_dim(args.observation_phase_mode)
     assert isinstance(envs.single_action_space, gym.spaces.Box), (
         "only continuous action space is supported"
+    )
+    phase_horizon = int(
+        args.imitation_time_horizon
+        or getattr(envs.envs[0].spec, "max_episode_steps", None)
+        or 1000
     )
 
     actor = Actor(envs, device=device, n_act=n_act, n_obs=n_obs)
@@ -402,10 +427,10 @@ if __name__ == "__main__":
         q_optimizer.zero_grad()
         with torch.no_grad():
             next_state_actions, next_state_log_pi, _ = actor.get_action(
-                data["next_observations"]
+                data["policy_next_observations"]
             )
             qf_next_target = torch.vmap(batched_qf, (0, None, None))(
-                qnet_target, data["next_observations"], next_state_actions
+                qnet_target, data["policy_next_observations"], next_state_actions
             )
             min_qf_next_target = (
                 qf_next_target.min(dim=0).values - alpha * next_state_log_pi
@@ -415,7 +440,7 @@ if __name__ == "__main__":
             ).float() * args.gamma * min_qf_next_target.view(-1)
 
         qf_a_values = torch.vmap(batched_qf, (0, None, None, None))(
-            qnet_params, data["observations"], data["actions"], next_q_value
+            qnet_params, data["policy_observations"], data["actions"], next_q_value
         )
         qf_loss = qf_a_values.sum(0)
 
@@ -425,9 +450,9 @@ if __name__ == "__main__":
 
     def update_pol(data):
         actor_optimizer.zero_grad()
-        pi, log_pi, _ = actor.get_action(data["observations"])
+        pi, log_pi, _ = actor.get_action(data["policy_observations"])
         qf_pi = torch.vmap(batched_qf, (0, None, None))(
-            qnet_params.data, data["observations"], pi
+            qnet_params.data, data["policy_observations"], pi
         )
         min_qf_pi = qf_pi.min(0).values
         actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
@@ -438,7 +463,7 @@ if __name__ == "__main__":
         if args.autotune:
             a_optimizer.zero_grad()
             with torch.no_grad():
-                _, log_pi, _ = actor.get_action(data["observations"])
+                _, log_pi, _ = actor.get_action(data["policy_observations"])
             alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
             alpha_loss.backward()
             a_optimizer.step()
@@ -451,7 +476,6 @@ if __name__ == "__main__":
     # Discriminator update (compilable + cudagraph-eligible)
     def update_disc(ud):
         loss_dict = disc.compute_loss(ud)
-        print(ud['policy_obs'].shape)
         total_loss = (
             loss_dict["d_loss"]
             + args.irm_coeff * loss_dict["grad_penalty"]
@@ -508,9 +532,14 @@ if __name__ == "__main__":
         obs_buf, acs_buf, rew_buf, done_buf = [], [], [], []
         obs, _ = base_env.reset(seed=args.seed)
         obs_t = torch.as_tensor(obs, device=device, dtype=torch.float)
+        episode_steps = torch.zeros(base_env.num_envs, device=device, dtype=torch.float32)
         with torch.no_grad():
             while len(ep_returns) < n_episodes:
-                mean_action = actor.get_action(obs_t)[2]
+                phase_t, _ = compute_online_phases(episode_steps, horizon=phase_horizon)
+                policy_obs_t = augment_observations(
+                    obs_t, phase_t, args.observation_phase_mode
+                )
+                mean_action = actor.get_action(policy_obs_t)[2]
                 next_obs, rewards, terminations, truncations, infos = base_env.step(
                     mean_action.cpu().numpy()
                 )
@@ -523,6 +552,14 @@ if __name__ == "__main__":
                         ep_returns.append(float(info["episode"]["r"]))
                 obs = next_obs
                 obs_t = torch.as_tensor(obs, device=device, dtype=torch.float)
+                done_t = torch.as_tensor(
+                    terminations | truncations, device=device, dtype=torch.bool
+                )
+                episode_steps = torch.where(
+                    done_t,
+                    torch.zeros_like(episode_steps),
+                    episode_steps + 1.0,
+                )
         base_env.close()
         avg_ret = float(np.mean(ep_returns)) if ep_returns else 0.0
         if args.save_demo:
@@ -572,20 +609,36 @@ if __name__ == "__main__":
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.RecordVideo(env, video_dir, episode_trigger=lambda e: True)
         obs, _ = env.reset(seed=args.seed)
+        episode_steps_video = torch.zeros(1, device=device, dtype=torch.float32)
         t = 0
         with torch.no_grad():
             while t < args.save_video_length:
-                obs_t = torch.as_tensor(obs, device=device, dtype=torch.float)
-                mean_action = actor.get_action(obs_t)[2]
-                obs, _, term, trunc, _ = env.step(mean_action.cpu().numpy())
+                obs_t = torch.as_tensor(
+                    np.expand_dims(obs, axis=0), device=device, dtype=torch.float
+                )
+                phase_t, _ = compute_online_phases(
+                    episode_steps_video, horizon=phase_horizon
+                )
+                policy_obs_t = augment_observations(
+                    obs_t, phase_t, args.observation_phase_mode
+                )
+                mean_action = actor.get_action(policy_obs_t)[2]
+                obs, _, term, trunc, _ = env.step(mean_action.cpu().numpy()[0])
                 t += 1
+                done_t = torch.as_tensor([term or trunc], device=device, dtype=torch.bool)
+                episode_steps_video = torch.where(
+                    done_t,
+                    torch.zeros_like(episode_steps_video),
+                    episode_steps_video + 1.0,
+                )
                 if term or trunc:
                     break
         env.close()
 
     # Main loop
     obs, _ = envs.reset(seed=args.seed)
-    obs = torch.as_tensor(obs, dtype=torch.float)
+    obs = torch.as_tensor(obs, device=device, dtype=torch.float)
+    episode_steps = torch.zeros(envs.num_envs, device=device, dtype=torch.float32)
     pbar = tqdm.tqdm(range(args.total_timesteps))
     start_time = None
     max_ep_ret = -float("inf")
@@ -606,8 +659,12 @@ if __name__ == "__main__":
                 [envs.single_action_space.sample() for _ in range(envs.num_envs)]
             )
         else:
+            phase, _ = compute_online_phases(episode_steps, horizon=phase_horizon)
+            policy_obs = augment_observations(
+                obs, phase, args.observation_phase_mode
+            )
             td_in = TensorDict(
-                {"observation": obs}, batch_size=obs.shape[0], device=device
+                {"observation": policy_obs}, batch_size=obs.shape[0], device=device
             )
             td_out = policy(td_in)
             actions = td_out["action"].detach().cpu().numpy()
@@ -622,6 +679,8 @@ if __name__ == "__main__":
             desc = f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f})"
 
         next_obs = torch.as_tensor(next_obs, device=device, dtype=torch.float)
+        terminations_t = torch.as_tensor(terminations, device=device, dtype=torch.bool)
+        truncations_t = torch.as_tensor(truncations, device=device, dtype=torch.bool)
         real_next_obs = next_obs.clone()
         if "final_observation" in infos:
             for idx, final_obs in enumerate(infos["final_observation"]):
@@ -629,18 +688,37 @@ if __name__ == "__main__":
                     real_next_obs[idx] = torch.as_tensor(
                         final_obs, device=device, dtype=torch.float
                     )
+        done_mask = terminations_t | truncations_t
+        phase, next_phase = compute_online_phases(
+            episode_steps,
+            horizon=phase_horizon,
+            done=done_mask,
+        )
+        policy_obs = augment_observations(obs, phase, args.observation_phase_mode)
+        policy_next_obs = augment_observations(
+            real_next_obs, next_phase, args.observation_phase_mode
+        )
         transition = TensorDict(
             observations=obs,
             next_observations=real_next_obs,
+            policy_observations=policy_obs,
+            policy_next_observations=policy_next_obs,
             actions=torch.as_tensor(actions, device=device, dtype=torch.float),
             rewards=torch.as_tensor(rewards, device=device, dtype=torch.float),
-            terminations=terminations,
-            dones=terminations,
+            terminations=terminations_t,
+            dones=terminations_t,
+            phase=phase,
+            next_phase=next_phase,
             batch_size=obs.shape[0],
             device=device,
         )
 
         obs = next_obs
+        episode_steps = torch.where(
+            done_mask,
+            torch.zeros_like(episode_steps),
+            episode_steps + 1.0,
+        )
         rb.extend(transition)
 
         # ALGO LOGIC: training SAC
@@ -667,9 +745,12 @@ if __name__ == "__main__":
                     args,
                     demos_all,
                     data["observations"],
+                    data["next_observations"],
                     data["actions"],
                     data["dones"],
                     actor,
+                    phase=data.get("phase", None),
+                    next_phase=data.get("next_phase", None),
                 )
                 if args.cudagraphs:
                     if disc_graph is None:

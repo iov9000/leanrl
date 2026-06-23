@@ -383,7 +383,7 @@ if __name__ == "__main__":
                     dones_ = b_dones
                 
                 update_dict = prepare_batch_update_irl(
-                    envs, args, d, obs_, actions_, dones_, agent
+                    envs, args, d, obs_, None, actions_, dones_, agent
                 )
                 
                 loss_dict = discriminator.compute_loss(update_dict)

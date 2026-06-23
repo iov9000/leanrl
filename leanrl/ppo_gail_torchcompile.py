@@ -481,6 +481,7 @@ if __name__ == "__main__":
             args,
             demos_all,
             b_obs,
+            None,
             b_actions,
             b_dones,
             agent, # PPO agent is used for importance sampling if needed, but GAIL usually doesn't need it for disc update unless using specific losses

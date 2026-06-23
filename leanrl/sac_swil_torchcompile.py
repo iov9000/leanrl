@@ -37,7 +37,7 @@ class Args:
     capture_video: bool = False
 
     # Algorithm specific arguments
-    env_id: str = "HalfCheetah-v4"
+    env_id: str = "HalfCheetah-v5"
     total_timesteps: int = 1_000_000
     buffer_size: int = int(1e6)
     gamma: float = 0.99
@@ -74,8 +74,8 @@ class Args:
     radon_df_type: str = "poly"
     sw_poly_deg: int = 2
     max_gsw: bool = False
-    n_proj: int = 1
-    swil_loss: str = "surr_loss"  # surr_loss/approx_sw/atom_gsw
+    n_proj: int = 64
+    swil_loss: str = "gsw"  # surr_loss/approx_sw/atom_gsw
     swil_rew: str = "repl_loss"  # old_swil/replacement_nn/insertion_loss
     repl_loss_type: str = "diff2"  # diff/diffmax0/diff2/diff2max0/diff3
     swil_vb: int = 0
@@ -102,6 +102,16 @@ class Args:
     lip_p: float = 1.0
     l2_coeff: float = 0.0
     proj_norm_coeff: float = 0.0
+    mgsw_output_normalize: bool = True
+    mgsw_use_bounded_alpha: bool = True
+    mgsw_alpha_min: float = 0.1
+    mgsw_alpha_max: float = 5.0
+    mgsw_var_reg_coef: float = 1e-2
+    mgsw_target_std: float = 1.0
+    mgsw_weight_reg_coef: float = 1e-6
+    mgsw_projection_norm_mode: str = "weight_penalty"  # none/weight_penalty/post_step_clip/spectral_norm
+    mgsw_projection_post_step_max_norm: float = 10.0
+    log_disc_grad_norms: bool = True
     irl_epochs: int = 1
     irl_init_epochs: int = 1
     warmup_irl: bool = False
@@ -110,10 +120,13 @@ class Args:
     on_policy: bool = False
     # New buffer-based SWIL implementation switch and options
     swil_impl: str = "old"  # 'old' (discriminator) or 'new' (buffer-based SR/DUAL/RPL) or 'pot' (potential-based)
-    swil_variant: str = "SR"  # SR | DUAL | RPL (only for swil_impl='new')
-    swil_agg: str = "mean"  # mean | softmax | max
+    swil_variant: str = "DUAL"  # DUAL main method; SR/RPL ablations (only for swil_impl='new')
+    swil_agg: str = "softmax"  # mean | softmax | max
     swil_tau: float = 0.5
     swil_qgrid: int = 1024
+    swil_occ_buffer_size: int = 32768
+    swil_feature_norm: bool = True
+    swil_feature_sigma_min: float = 1e-2
 
     # Checkpoint / evaluation
     wandb_entity: str = None
@@ -432,6 +445,49 @@ if __name__ == "__main__":
 
     update_disc = None
     if args.swil_impl in ["old", "pot"]:
+        def _safe_module_grad_norm(module: nn.Module | None, device: torch.device) -> torch.Tensor:
+            if module is None:
+                return torch.tensor(0.0, device=device)
+            total = torch.tensor(0.0, device=device)
+            for p in module.parameters():
+                if p.grad is not None:
+                    total = total + (p.grad.detach().pow(2).sum())
+            return total.sqrt()
+
+        def _safe_disc_grad_norms(disc_module: nn.Module) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            dev = next(disc_module.parameters()).device
+            total_sq = torch.tensor(0.0, device=dev)
+            max_abs = torch.tensor(0.0, device=dev)
+            for p in disc_module.parameters():
+                if p.grad is not None:
+                    g = p.grad.detach()
+                    total_sq = total_sq + g.pow(2).sum()
+                    max_abs = torch.maximum(max_abs, g.abs().max())
+            total = total_sq.sqrt()
+            base = _safe_module_grad_norm(getattr(disc_module, "base", None), dev)
+            reward = _safe_module_grad_norm(getattr(disc_module, "reward", None), dev)
+            return total, base, reward, max_abs
+
+        def _safe_proj_stats(ud: TensorDict, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            # For SWIL "old" MGSW discriminator, log projection activation scale and tanh saturation proxy.
+            if args.swil_impl != "old" or not hasattr(disc, "proj"):
+                z = torch.tensor(0.0, device=device)
+                return z, z, z, z
+            with torch.no_grad():
+                try:
+                    pi_proj, _, _, _ = disc.proj(
+                        ud["policy_obs"], ud["policy_acs"], ud["policy_obs_next"], ud["policy_dones"]
+                    )
+                    ex_proj, _, _, _ = disc.proj(
+                        ud["expert_obs"], ud["expert_acs"], ud["expert_obs_next"], ud["expert_dones"]
+                    )
+                    pi_sat = (pi_proj.abs() > 0.95).float().mean()
+                    ex_sat = (ex_proj.abs() > 0.95).float().mean()
+                    return pi_proj.std(unbiased=False), ex_proj.std(unbiased=False), pi_sat, ex_sat
+                except Exception:
+                    z = torch.tensor(0.0, device=device)
+                    return z, z, z, z
+
         # Discriminator update (compilable + cudagraph-eligible)
         def update_disc(ud):
             loss_dict = disc.compute_loss(ud)
@@ -439,11 +495,19 @@ if __name__ == "__main__":
                 loss_dict["d_loss"]
                 + args.irm_coeff * loss_dict["grad_penalty"]
                 + args.vb_coeff * loss_dict["ib_loss"]
+                + loss_dict.get("var_reg", torch.tensor(0.0, device=device))
+                + loss_dict.get("weight_reg", torch.tensor(0.0, device=device))
             )
             disc.d_optimizer.zero_grad()
             if args.swil_loss != "approx_sw":
                 total_loss.backward()
+            grad_total, grad_base, grad_reward, grad_max_abs = _safe_disc_grad_norms(disc)
+            proj_pi_std, proj_exp_std, proj_pi_sat, proj_exp_sat = _safe_proj_stats(
+                ud, grad_total.device
+            )
             disc.d_optimizer.step()
+            if hasattr(disc, "post_step_projection_clip"):
+                disc.post_step_projection_clip()
             return TensorDict(
                 d_loss=loss_dict["d_loss"].detach(),
                 grad_penalty=torch.as_tensor(loss_dict["grad_penalty"]).detach()
@@ -452,6 +516,20 @@ if __name__ == "__main__":
                 ib_loss=torch.as_tensor(loss_dict["ib_loss"]).detach()
                 if isinstance(loss_dict["ib_loss"], torch.Tensor)
                 else torch.zeros_like(loss_dict["d_loss"]).detach() * 0.0,
+                grad_norm_total=grad_total.detach(),
+                grad_norm_base=grad_base.detach(),
+                grad_norm_reward=grad_reward.detach(),
+                grad_abs_max=grad_max_abs.detach(),
+                proj_pi_std=proj_pi_std.detach(),
+                proj_exp_std=proj_exp_std.detach(),
+                proj_pi_sat=proj_pi_sat.detach(),
+                proj_exp_sat=proj_exp_sat.detach(),
+                var_reg=torch.as_tensor(loss_dict.get("var_reg", 0.0), device=grad_total.device).detach(),
+                weight_reg=torch.as_tensor(loss_dict.get("weight_reg", 0.0), device=grad_total.device).detach(),
+                proj_raw_mean=torch.as_tensor(loss_dict.get("proj_raw_mean", 0.0), device=grad_total.device).detach(),
+                proj_raw_std=torch.as_tensor(loss_dict.get("proj_raw_std", 0.0), device=grad_total.device).detach(),
+                proj_eff_std=torch.as_tensor(loss_dict.get("proj_eff_std", 0.0), device=grad_total.device).detach(),
+                proj_alpha=torch.as_tensor(loss_dict.get("proj_alpha", 0.0), device=grad_total.device).detach(),
             )
 
     if args.compile:
@@ -624,7 +702,7 @@ if __name__ == "__main__":
                     dones_ = b_dones
 
                 ud_warm = prepare_batch_update_irl(
-                    envs, args, d, obs_, actions_, dones_, actor
+                    envs, args, d, obs_, None, actions_, dones_, actor
                 )
                 _ = update_disc(ud_warm)
 
@@ -733,6 +811,7 @@ if __name__ == "__main__":
                                 args,
                                 d,
                                 obs_,
+                                data["next_observations"],
                                 actions_,
                                 dones_,
                                 actor,
@@ -755,20 +834,93 @@ if __name__ == "__main__":
                                 out_disc = update_disc(ud)
 
                     if global_step % 100 == 0:
-                        wandb.log(
-                            {
-                                "irl/d_loss": out_disc["d_loss"].mean().item(),
-                                "irl/ib_loss": out_disc.get("ib_loss", torch.tensor(0.0))
-                                .mean()
-                                .item(),
-                                "irl/grad_penalty": out_disc.get(
-                                    "grad_penalty", torch.tensor(0.0)
-                                )
-                                .mean()
-                                .item(),
-                            },
-                            step=global_step,
-                        )
+                        irl_logs = {
+                            "irl/d_loss": out_disc["d_loss"].mean().item(),
+                            "irl/ib_loss": out_disc.get("ib_loss", torch.tensor(0.0))
+                            .mean()
+                            .item(),
+                            "irl/grad_penalty": out_disc.get(
+                                "grad_penalty", torch.tensor(0.0)
+                            )
+                            .mean()
+                            .item(),
+                        }
+                        if args.log_disc_grad_norms:
+                            irl_logs.update(
+                                {
+                                    "irl/grad_norm_total": out_disc.get(
+                                        "grad_norm_total", torch.tensor(0.0)
+                                    )
+                                    .mean()
+                                    .item(),
+                                    "irl/grad_norm_base": out_disc.get(
+                                        "grad_norm_base", torch.tensor(0.0)
+                                    )
+                                    .mean()
+                                    .item(),
+                                    "irl/grad_norm_reward": out_disc.get(
+                                        "grad_norm_reward", torch.tensor(0.0)
+                                    )
+                                    .mean()
+                                    .item(),
+                                    "irl/grad_abs_max": out_disc.get(
+                                        "grad_abs_max", torch.tensor(0.0)
+                                    )
+                                    .mean()
+                                    .item(),
+                                    "irl/proj_pi_std": out_disc.get(
+                                        "proj_pi_std", torch.tensor(0.0)
+                                    )
+                                    .mean()
+                                    .item(),
+                                    "irl/proj_exp_std": out_disc.get(
+                                        "proj_exp_std", torch.tensor(0.0)
+                                    )
+                                    .mean()
+                                    .item(),
+                                    "irl/proj_pi_sat": out_disc.get(
+                                        "proj_pi_sat", torch.tensor(0.0)
+                                    )
+                                    .mean()
+                                    .item(),
+                                    "irl/proj_exp_sat": out_disc.get(
+                                        "proj_exp_sat", torch.tensor(0.0)
+                                    )
+                                    .mean()
+                                    .item(),
+                                    "irl/proj_var_reg": out_disc.get(
+                                        "var_reg", torch.tensor(0.0)
+                                    )
+                                    .mean()
+                                    .item(),
+                                    "irl/proj_weight_reg": out_disc.get(
+                                        "weight_reg", torch.tensor(0.0)
+                                    )
+                                    .mean()
+                                    .item(),
+                                    "irl/proj_raw_mean": out_disc.get(
+                                        "proj_raw_mean", torch.tensor(0.0)
+                                    )
+                                    .mean()
+                                    .item(),
+                                    "irl/proj_raw_std": out_disc.get(
+                                        "proj_raw_std", torch.tensor(0.0)
+                                    )
+                                    .mean()
+                                    .item(),
+                                    "irl/proj_eff_std": out_disc.get(
+                                        "proj_eff_std", torch.tensor(0.0)
+                                    )
+                                    .mean()
+                                    .item(),
+                                    "irl/proj_alpha": out_disc.get(
+                                        "proj_alpha", torch.tensor(0.0)
+                                    )
+                                    .mean()
+                                    .item(),
+                                }
+                            )
+                        wandb.log(irl_logs, step=global_step)
 
             if args.save_interval and global_step % args.save_interval == 0:
                 ckpt_actor = os.path.join(

@@ -23,8 +23,12 @@ from tensordict.nn import CudaGraphModule, TensorDictModule
 
 from torchrl.data import LazyTensorStorage, ReplayBuffer
 
-from irl.pwil import PWILReward
-from irl.utils import load_hf_demos
+try:
+    from leanrl.irl.pwil import PWILReward
+    from leanrl.irl.utils import load_hf_demos
+except ImportError:
+    from irl.pwil import PWILReward
+    from irl.utils import load_hf_demos
 
 
 @dataclass
@@ -39,7 +43,7 @@ class Args:
     wandb_entity: Optional[str] = None
 
     # Algorithm specific arguments
-    env_id: str = "HalfCheetah-v4"
+    env_id: str = "HalfCheetah-v5"
     total_timesteps: int = 1_000_000
     buffer_size: int = int(1e6)
     gamma: float = 0.99
@@ -62,6 +66,7 @@ class Args:
     n_demos: int = 10
     subsample: int = 1
     use_actions: bool = True
+    pwil_time_horizon: float = 0.0  # 0 uses env.spec.max_episode_steps
     pwil_alpha: float = 5.0
     pwil_beta: float = 5.0
     random_offset: int = 1
@@ -195,6 +200,9 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    use_cudagraphs = bool(args.cudagraphs and device.type == "cuda")
+    if args.cudagraphs and not use_cudagraphs:
+        print("CUDA graphs requested but CUDA is not active; running without CUDA graphs.")
 
     # Load expert demos
     demos = load_hf_demos(args, n_demos=args.n_demos)
@@ -241,12 +249,12 @@ if __name__ == "__main__":
     qnet_params, qnet_target, qnet = get_q_params()
 
     q_optimizer = optim.Adam(
-        qnet.parameters(), lr=args.q_lr, capturable=args.cudagraphs and not args.compile
+        qnet.parameters(), lr=args.q_lr, capturable=use_cudagraphs and not args.compile
     )
     actor_optimizer = optim.Adam(
         list(actor.parameters()),
         lr=args.policy_lr,
-        capturable=args.cudagraphs and not args.compile,
+        capturable=use_cudagraphs and not args.compile,
     )
 
     # Automatic entropy tuning
@@ -257,7 +265,7 @@ if __name__ == "__main__":
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.detach().exp()
         a_optimizer = optim.Adam(
-            [log_alpha], lr=args.q_lr, capturable=args.cudagraphs and not args.compile
+            [log_alpha], lr=args.q_lr, capturable=use_cudagraphs and not args.compile
         )
     else:
         alpha = torch.as_tensor(args.alpha, device=device)
@@ -317,10 +325,14 @@ if __name__ == "__main__":
             alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
             alpha_loss.backward()
             a_optimizer.step()
+            return TensorDict(
+                alpha=alpha.detach(),
+                actor_loss=actor_loss.detach(),
+                alpha_loss=alpha_loss.detach(),
+            )
         return TensorDict(
             alpha=alpha.detach(),
             actor_loss=actor_loss.detach(),
-            alpha_loss=alpha_loss.detach(),
         )
 
     if args.compile:
@@ -329,7 +341,7 @@ if __name__ == "__main__":
         update_pol = torch.compile(update_pol, mode=mode)
         policy = torch.compile(policy, mode=mode)
 
-    if args.cudagraphs:
+    if use_cudagraphs:
         update_main = CudaGraphModule(update_main, in_keys=[], out_keys=[])
         update_pol = CudaGraphModule(update_pol, in_keys=[], out_keys=[])
 
@@ -439,11 +451,12 @@ if __name__ == "__main__":
                 [envs.single_action_space.sample() for _ in range(envs.num_envs)]
             )
         else:
-            td_in = TensorDict(
-                {"observation": obs}, batch_size=obs.shape[0], device=device
-            )
-            td_out = policy(td_in)
-            actions = td_out["action"].detach().cpu().numpy()
+            with torch.no_grad():
+                td_in = TensorDict(
+                    {"observation": obs}, batch_size=obs.shape[0], device=device
+                )
+                td_out = policy(td_in)
+            actions = td_out["action"].cpu().numpy()
 
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
@@ -451,7 +464,11 @@ if __name__ == "__main__":
             for r in infos["episode"]["r"][infos["episode"]["_r"]]:
                 max_ep_ret = max(max_ep_ret, r)
                 avg_returns.append(r)
-            desc = f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f})"
+            desc = (
+                f"global_step={global_step}, "
+                f"episodic_return={torch.tensor(avg_returns).mean(): 4.2f} "
+                f"(max={max_ep_ret: 4.2f})"
+            )
 
         next_obs = torch.as_tensor(next_obs, device=device, dtype=torch.float)
         real_next_obs = next_obs.clone()

@@ -282,9 +282,11 @@ class SwilRewardNew(gym.Wrapper):
         self.use_actions = opt.use_actions
         self.use_next_obs = opt.use_next_obs
         self.use_dones = opt.use_dones
-        self.variant = getattr(opt, "swil_variant", "SR").upper()
+        self.variant = getattr(opt, "swil_variant", "DUAL").upper()
         self.agg = getattr(opt, "swil_agg", "mean").lower()
         self.tau = float(getattr(opt, "swil_tau", 0.5))
+        self.feature_norm = bool(getattr(opt, "swil_feature_norm", True))
+        self.feature_sigma_min = float(getattr(opt, "swil_feature_sigma_min", 1e-2))
         self.obs = None
         self.traj, self.traj_ = [], []
         self.cnt = 0
@@ -306,9 +308,8 @@ class SwilRewardNew(gym.Wrapper):
             dim0 += ob_shapes[-1]
         self.K = int(getattr(self.opt, "n_proj", 10))
         # directions
-        self.dirs = torch.randn(self.K, dim0, dtype=torch.get_default_dtype())
-        self.dirs = torch.nn.functional.normalize(self.dirs, dim=-1)
-        # expert projections
+        self.dirs = self._make_directions(self.K, dim0, int(getattr(self.opt, "seed", 0)))
+        # expert features/projections
         exp_obs = torch.tensor(demos["obs"], dtype=torch.get_default_dtype())
         parts = [exp_obs]
         if self.use_actions and "acs" in demos:
@@ -322,6 +323,8 @@ class SwilRewardNew(gym.Wrapper):
             next_obs = np.concatenate([demos["obs"][1:], demos["obs"][-1:]], 0)
             parts.append(torch.tensor(next_obs, dtype=torch.get_default_dtype()))
         Xexp = torch.cat(parts, dim=-1)
+        self._fit_feature_stats(Xexp)
+        Xexp = self._normalize_features(Xexp)
         Zexp = Xexp @ self.dirs.t()  # [N,K]
         Zexp = Zexp.transpose(0, 1).contiguous()  # [K,N]
         # store expert projections as a single sorted matrix [K, N]
@@ -331,14 +334,55 @@ class SwilRewardNew(gym.Wrapper):
         self.qgrid = int(getattr(self.opt, "swil_qgrid", 1025))
         if self.use_lut:
             self._build_exp_lut()
-        # policy buffer: maintain per-projection sorted arrays incrementally
-        self.cap = 8192
+        # Current-policy occupancy buffer. This is intentionally separate from
+        # SAC replay and uses FIFO eviction by sample age, not by projected value.
+        self.cap = int(getattr(self.opt, "swil_occ_buffer_size", 32768))
         self.pol_sorted = torch.full(
             (self.K, self.cap), float("inf"), dtype=torch.get_default_dtype()
         )
         self.counts = torch.zeros(self.K, dtype=torch.long)
+        self.occ_proj = torch.empty(
+            (self.cap, self.K), dtype=torch.get_default_dtype()
+        )
+        self.occ_count = 0
+        self.occ_cursor = 0
         self.J = torch.arange(self.cap, dtype=torch.long)
         self.rpl_cursor = 0
+        self.last_slice_weights = torch.full(
+            (self.K,), 1.0 / max(self.K, 1), dtype=torch.get_default_dtype()
+        )
+        self.last_k_eff = float(self.K)
+
+    @staticmethod
+    def _make_directions(K: int, dim: int, seed: int) -> torch.Tensor:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+        blocks = []
+        remaining = K
+        while remaining > 0:
+            block = min(dim, remaining)
+            mat = torch.randn(dim, block, generator=generator, dtype=torch.get_default_dtype())
+            q, _ = torch.linalg.qr(mat, mode="reduced")
+            blocks.append(q[:, :block].transpose(0, 1).contiguous())
+            remaining -= block
+        dirs = torch.cat(blocks, dim=0)
+        return torch.nn.functional.normalize(dirs, dim=-1)
+
+    def _fit_feature_stats(self, x: torch.Tensor) -> None:
+        if not self.feature_norm:
+            self.feature_mean = torch.zeros(
+                x.shape[-1], dtype=x.dtype, device=x.device
+            )
+            self.feature_scale = torch.ones(
+                x.shape[-1], dtype=x.dtype, device=x.device
+            )
+            return
+        self.feature_mean = x.mean(dim=0)
+        scale = x.std(dim=0, unbiased=False)
+        self.feature_scale = torch.clamp(scale, min=self.feature_sigma_min)
+
+    def _normalize_features(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.feature_mean.to(x.device)) / self.feature_scale.to(x.device)
 
     def reset(
         self, seed: int = 0, options: Optional[Dict[str, Any]] = None
@@ -484,19 +528,29 @@ class SwilRewardNew(gym.Wrapper):
             return yhat.squeeze(1)
         return yhat
 
-    def _agg(self, per: torch.Tensor) -> torch.Tensor:
+    def _agg(
+        self, values: torch.Tensor, scores: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Aggregate per-projection values.
+
+        For smooth/max sliced objectives, weights are functions of per-slice
+        distances, not necessarily of the values being combined.
+        """
         if self.agg == "mean":
-            return per.mean()
+            return values.mean()
+        scores = values if scores is None else scores
         if self.agg == "max":
-            return per.max()
-        x = per / max(self.tau, 1e-6)
+            return values[torch.argmax(scores)]
+        x = scores / max(self.tau, 1e-6)
         x = x - x.max()
         w = torch.softmax(x, dim=0)
-        return (w * per).sum()
+        self.last_slice_weights = w.detach()
+        entropy = -(w * torch.log(torch.clamp(w, min=1e-12))).sum()
+        self.last_k_eff = float(torch.exp(entropy).detach().cpu())
+        return (w * values).sum()
 
-    def _insert(self, z: torch.Tensor) -> None:
-        """Insert a new sample z into per-projection sorted buffers (vectorized)."""
-        Z = z @ self.dirs.t()  # [K]
+    def _insert_sorted_projection(self, Z: torch.Tensor) -> None:
+        """Insert projected sample Z into per-projection sorted buffers."""
         s = self.pol_sorted
         c = self.counts
         K, C = s.shape
@@ -516,6 +570,37 @@ class SwilRewardNew(gym.Wrapper):
         new_s.scatter_(1, pos.unsqueeze(1), Z.unsqueeze(1))
         self.pol_sorted = new_s
         self.counts = torch.minimum(c + 1, torch.full_like(c, self.cap))
+
+    def _remove_sorted_projection(self, Z: torch.Tensor) -> None:
+        """Remove one projected sample from per-projection sorted buffers."""
+        s = self.pol_sorted
+        c = self.counts
+        K, C = s.shape
+        device = s.device
+        if torch.any(c <= 0):
+            return
+        pos = torch.searchsorted(s, Z.unsqueeze(1), right=False).squeeze(1)
+        pos = torch.minimum(pos, torch.clamp(c - 1, min=0))
+        idx = torch.arange(C, device=device).unsqueeze(0).expand(K, -1)
+        cm1 = torch.clamp(c - 1, min=0)
+        mask_leftshift = (idx >= pos.unsqueeze(1)) & (idx < cm1.unsqueeze(1))
+        src_left = s.gather(1, torch.clamp(idx + 1, max=C - 1))
+        new_s = torch.where(mask_leftshift, src_left, s)
+        inf_col = torch.full((K, 1), float("inf"), dtype=s.dtype, device=device)
+        new_s.scatter_(1, cm1.unsqueeze(1), inf_col)
+        self.pol_sorted = new_s
+        self.counts = cm1
+
+    def _insert(self, z: torch.Tensor) -> None:
+        """Insert a new normalized feature sample into the current-policy FIFO buffer."""
+        Z = z @ self.dirs.t()  # [K]
+        if self.occ_count >= self.cap:
+            self._remove_sorted_projection(self.occ_proj[self.occ_cursor])
+        else:
+            self.occ_count += 1
+        self.occ_proj[self.occ_cursor] = Z
+        self.occ_cursor = (self.occ_cursor + 1) % self.cap
+        self._insert_sorted_projection(Z)
 
     def _replace_effect_sorted(self, Z: torch.Tensor) -> torch.Tensor:
         """Return the per-row sorted arrays after replacing one element with Z.
@@ -567,7 +652,7 @@ class SwilRewardNew(gym.Wrapper):
         next_obs_t = torch.as_tensor(next_obs, dtype=dtype, device=device)
         done_t = torch.as_tensor(done, dtype=dtype, device=device)
 
-        z = self._feats(obs_t, acs_t, next_obs_t, done_t)
+        z = self._normalize_features(self._feats(obs_t, acs_t, next_obs_t, done_t))
         Znew = z @ self.dirs.t()  # [K]
         pol_sorted_mat, counts = self._policy_sorted()
         K = self.K
@@ -605,15 +690,32 @@ class SwilRewardNew(gym.Wrapper):
                 q_rows = ((J.to(pol_sorted_mat.dtype) + 0.5) / denom).clamp(0.0, 1.0)
                 # y_on_z for each row over its own support via LUT
                 y_on_z = self._qmap_from_q(q_rows)
-                g = (pol_sorted_mat - y_on_z) * mask_valid.to(pol_sorted_mat.dtype)
+                g = torch.where(
+                    mask_valid,
+                    pol_sorted_mat - y_on_z,
+                    torch.zeros_like(pol_sorted_mat),
+                )
+                per_slice_dist = g.pow(2).sum(dim=1) / torch.clamp(
+                    counts.to(g.dtype), min=1.0
+                )
+                per_slice_dist = torch.where(
+                    counts > 1, per_slice_dist, torch.zeros_like(per_slice_dist)
+                )
                 # cumulative trapezoidal integration per row
-                dz = pol_sorted_mat[:, 1:] - pol_sorted_mat[:, :-1]
+                pair_valid = mask_valid[:, 1:] & mask_valid[:, :-1]
+                dz = torch.where(
+                    pair_valid,
+                    pol_sorted_mat[:, 1:] - pol_sorted_mat[:, :-1],
+                    torch.zeros_like(pol_sorted_mat[:, 1:]),
+                )
                 trap = 0.5 * (g[:, 1:] + g[:, :-1]) * dz
                 phi = torch.zeros_like(pol_sorted_mat)
                 phi[:, 1:] = torch.cumsum(trap, dim=1)
+                phi = torch.where(mask_valid, phi, torch.zeros_like(phi))
                 # center per row
                 denom = torch.clamp(counts.to(phi.dtype), min=1.0)
-                phi = phi - (phi.sum(dim=1) / denom).unsqueeze(1)
+                phi_mean = (phi.sum(dim=1) / denom).unsqueeze(1)
+                phi = torch.where(mask_valid, phi - phi_mean, torch.zeros_like(phi))
                 # evaluate phi at Znew via linear interpolation
                 q = torch.searchsorted(
                     pol_sorted_mat, Znew.unsqueeze(1), right=False
@@ -629,7 +731,7 @@ class SwilRewardNew(gym.Wrapper):
                 val = y0 * (1.0 - t) + y1 * t
                 # zero rows with insufficient samples
                 val = torch.where(counts > 1, val, torch.zeros_like(val))
-                rew = -self._agg(val)
+                rew = -self._agg(val, per_slice_dist)
         else:
             # RPL
             if self.exp_sorted.numel() == 0:
@@ -675,4 +777,6 @@ class SwilRewardNew(gym.Wrapper):
             self.traj = []
             self.traj_ = []
 
+        info["swil_k_eff"] = self.last_k_eff
+        info["swil_occ_count"] = self.occ_count
         return next_obs, float(rew.item()), term, trunc, info

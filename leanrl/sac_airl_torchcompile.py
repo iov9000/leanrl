@@ -26,6 +26,10 @@ from torchrl.data import LazyTensorStorage, ReplayBuffer
 
 from irl.airl import AIRLDiscriminator, AirlReward
 from irl.utils import load_hf_demos, prepare_batch_update_irl
+try:
+    from leanrl.il_utils import compute_online_phases, validate_phase_mode
+except ImportError:
+    from il_utils import compute_online_phases, validate_phase_mode
 
 
 @dataclass
@@ -67,6 +71,8 @@ class Args:
     n_demos: int = 10
     subsample: int = 1
     normalize_irl_rewards: bool = False
+    imitation_phase_mode: str = "none"
+    imitation_time_horizon: int = 0
 
     # Discriminator architecture/behavior
     use_actions: bool = True
@@ -197,6 +203,7 @@ class Actor(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    validate_phase_mode(args.imitation_phase_mode)
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{args.compile}__{args.cudagraphs}"
 
     if args.track:
@@ -218,6 +225,11 @@ if __name__ == "__main__":
     # Load expert demos
     demos = load_hf_demos(args, n_demos=args.n_demos)
     demos_all = demos["all"]
+    for k in ["obs", "acs", "rew", "done", "phase", "next_phase", "next_obs"]:
+        if k in demos_all:
+            demos_all[k] = torch.as_tensor(
+                demos_all[k], device=device, dtype=torch.float32
+            )
 
     # Create a single env for discriminator shape init
     shape_env = gym.make(args.env_id)
@@ -252,6 +264,11 @@ if __name__ == "__main__":
     n_obs = math.prod(envs.single_observation_space.shape)
     assert isinstance(envs.single_action_space, gym.spaces.Box), (
         "only continuous action space is supported"
+    )
+    phase_horizon = int(
+        args.imitation_time_horizon
+        or getattr(envs.envs[0].spec, "max_episode_steps", None)
+        or 1000
     )
 
     actor = Actor(envs, device=device, n_act=n_act, n_obs=n_obs)
@@ -503,7 +520,8 @@ if __name__ == "__main__":
 
     # Main loop
     obs, _ = envs.reset(seed=args.seed)
-    obs = torch.as_tensor(obs, dtype=torch.float)
+    obs = torch.as_tensor(obs, device=device, dtype=torch.float)
+    episode_steps = torch.zeros(envs.num_envs, device=device, dtype=torch.float32)
     pbar = tqdm.tqdm(range(args.total_timesteps))
     start_time = None
     max_ep_ret = -float("inf")
@@ -540,6 +558,8 @@ if __name__ == "__main__":
             desc = f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f})"
 
         next_obs = torch.as_tensor(next_obs, device=device, dtype=torch.float)
+        terminations_t = torch.as_tensor(terminations, device=device, dtype=torch.bool)
+        truncations_t = torch.as_tensor(truncations, device=device, dtype=torch.bool)
         real_next_obs = next_obs.clone()
         if "final_observation" in infos:
             for idx, final_obs in enumerate(infos["final_observation"]):
@@ -547,18 +567,31 @@ if __name__ == "__main__":
                     real_next_obs[idx] = torch.as_tensor(
                         final_obs, device=device, dtype=torch.float
                     )
+        done_mask = terminations_t | truncations_t
+        phase, next_phase = compute_online_phases(
+            episode_steps,
+            horizon=phase_horizon,
+            done=done_mask,
+        )
         transition = TensorDict(
             observations=obs,
             next_observations=real_next_obs,
             actions=torch.as_tensor(actions, device=device, dtype=torch.float),
             rewards=torch.as_tensor(rewards, device=device, dtype=torch.float),
-            terminations=terminations,
-            dones=terminations,
+            terminations=terminations_t,
+            dones=terminations_t,
+            phase=phase,
+            next_phase=next_phase,
             batch_size=obs.shape[0],
             device=device,
         )
 
         obs = next_obs
+        episode_steps = torch.where(
+            done_mask,
+            torch.zeros_like(episode_steps),
+            episode_steps + 1.0,
+        )
         rb.extend(transition)
 
         # ALGO LOGIC: training SAC
@@ -584,9 +617,12 @@ if __name__ == "__main__":
                     args,
                     demos_all,
                     data["observations"],
+                    data["next_observations"],
                     data["actions"],
                     data["dones"],
                     actor,
+                    phase=data.get("phase", None),
+                    next_phase=data.get("next_phase", None),
                 )
                 if args.cudagraphs:
                     if disc_graph is None or any(

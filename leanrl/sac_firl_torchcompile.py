@@ -567,6 +567,7 @@ if __name__ == "__main__":
                     args,
                     demos_all,
                     data["observations"],
+                    data["next_observations"],
                     data["actions"],
                     data["dones"],
                     actor,

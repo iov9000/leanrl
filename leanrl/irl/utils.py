@@ -18,10 +18,40 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+try:
+    from leanrl.il_utils import compute_demo_phases, validate_phase_mode
+except ImportError:
+    from il_utils import compute_demo_phases, validate_phase_mode
+
 DemoDict = Dict[str, Dict[str, np.ndarray]]
 TensorDict = Dict[str, torch.Tensor]
 
 # from drqv2 import DrQV2Agent, Encoder
+
+
+def _augment_demo_dict_with_phase(
+    demos: Dict[str, np.ndarray],
+    phase_mode: str,
+) -> Dict[str, np.ndarray]:
+    if validate_phase_mode(phase_mode) == "none":
+        return demos
+
+    phase, next_phase = compute_demo_phases(
+        demos["done"],
+        traj_ids=demos.get("traj_ids"),
+    )
+    demos["phase"] = phase.astype(np.float32)
+    demos["next_phase"] = next_phase.astype(np.float32)
+
+    if "support_done" in demos:
+        support_phase, support_next_phase = compute_demo_phases(
+            demos["support_done"],
+            traj_ids=demos.get("support_traj_ids"),
+        )
+        demos["support_phase"] = support_phase.astype(np.float32)
+        demos["support_next_phase"] = support_next_phase.astype(np.float32)
+
+    return demos
 
 
 def load_hf_demos(
@@ -34,6 +64,7 @@ def load_hf_demos(
     folder = args.demo_dir
     env_name = args.env_id
     subsample = args.subsample
+    phase_mode = getattr(args, "imitation_phase_mode", "none")
     if folder is None:
         folder = "demos"
     expert_demos = {}
@@ -70,6 +101,7 @@ def load_hf_demos(
         expert_demos["all"]["acs"] = expert_demos["all"]["acs"][::subsample]
         expert_demos["all"]["rew"] = expert_demos["all"]["rew"][::subsample]
         expert_demos["all"]["done"] = expert_demos["all"]["done"][::subsample]
+        _augment_demo_dict_with_phase(expert_demos["all"], phase_mode)
 
     except:
         print("Generate demos from HuggingFace Hub first")
@@ -84,6 +116,7 @@ def load_hf_demos_name(
     folder = args.demo_dir
     env_name = args.env_id
     subsample = args.subsample
+    phase_mode = getattr(args, "imitation_phase_mode", "none")
     if folder is None:
         folder = "demos"
     expert_demos = {}
@@ -114,6 +147,7 @@ def load_hf_demos_name(
                 expert_demos[fn]["support_acs"] = expert_demos[fn]["acs"][::subsample]
                 expert_demos[fn]["support_rew"] = expert_demos[fn]["rew"][::subsample]
                 expert_demos[fn]["support_done"] = expert_demos[fn]["done"][::subsample]
+            _augment_demo_dict_with_phase(expert_demos[fn], phase_mode)
         except:
             print("Generate demos from HuggingFace Hub first")
             assert False
@@ -146,6 +180,7 @@ def load_hf_demos_name(
     expert_demos["all"]["support_acs"] = np.concatenate(support_acs_all, 0)
     expert_demos["all"]["support_rew"] = np.concatenate(support_rew_all, 0)
     expert_demos["all"]["support_done"] = np.concatenate(support_done_all, 0)
+    _augment_demo_dict_with_phase(expert_demos["all"], phase_mode)
 
     return expert_demos
 
@@ -162,6 +197,7 @@ def load_fast_demos(
     expert_demos = {}
     folder = args.demo_dir
     subsample = args.subsample
+    phase_mode = getattr(args, "imitation_phase_mode", "none")
 
     if folder is None:
         folder = "demos"
@@ -175,6 +211,7 @@ def load_fast_demos(
         expert_demos["all"]["acs"] = expert_demos["all"]["acs"][10::subsample]
         expert_demos["all"]["rew"] = expert_demos["all"]["rew"][10::subsample]
         expert_demos["all"]["done"] = expert_demos["all"]["done"][10::subsample]
+        _augment_demo_dict_with_phase(expert_demos["all"], phase_mode)
     except:
         print(f"No FAST demo found for {filename}, go find it!")
         assert False
@@ -436,7 +473,7 @@ def demos_gen_dict(
         if drop_last and end > len(data["obs"]):
             break
         mb_inds = b_inds[i:end]
-        yield {
+        batch = {
             "obs": data["obs"][mb_inds],
             "acs": data["acs"][mb_inds],
             "rew": data["rew"][mb_inds],
@@ -446,6 +483,13 @@ def demos_gen_dict(
             "support_rew": data["support_rew"][mb_inds],
             "support_done": data["support_done"][mb_inds],
         }
+        if "phase" in data:
+            batch["phase"] = data["phase"][mb_inds]
+            batch["next_phase"] = data["next_phase"][mb_inds]
+        if "support_phase" in data:
+            batch["support_phase"] = data["support_phase"][mb_inds]
+            batch["support_next_phase"] = data["support_next_phase"][mb_inds]
+        yield batch
 
 
 def demos_sample_batch(
@@ -457,12 +501,16 @@ def demos_sample_batch(
 
     i = np.random.randint(0, len(data["obs"]) - batch_size)
     end = i + batch_size
-    return {
+    batch = {
         "obs": data["obs"][i:end],
         "acs": data["acs"][i:end],
         "rew": data["rew"][i:end],
         "done": data["done"][i:end],
     }
+    if "phase" in data:
+        batch["phase"] = data["phase"][i:end]
+        batch["next_phase"] = data["next_phase"][i:end]
+    return batch
 
 
 def get_concat_samples(
@@ -533,9 +581,12 @@ def prepare_batch_update_irl(
     opt: Namespace,
     expert_demos: Mapping[str, np.ndarray] | np.ndarray,
     obs: np.ndarray | torch.Tensor,
+    next_obs: np.ndarray | torch.Tensor | None,
     acs: np.ndarray | torch.Tensor,
     dones: np.ndarray | torch.Tensor,
     policy: nn.Module,
+    phase: np.ndarray | torch.Tensor | None = None,
+    next_phase: np.ndarray | torch.Tensor | None = None,
     compute_lprobs: bool = False,
     load_support: bool = False,
 ) -> TensorDict:
@@ -564,29 +615,67 @@ def prepare_batch_update_irl(
             t = torch.squeeze(t)
         return t
 
+    phase_mode = validate_phase_mode(getattr(opt, "imitation_phase_mode", "none"))
+
     obs_t = to_tensor(obs)
+    next_obs_t = to_tensor(next_obs) if next_obs is not None else None
     acs_t = to_tensor(acs)
     dones_t = to_tensor(dones, squeeze=True)
+    phase_t = to_tensor(phase, squeeze=True) if phase is not None else None
+    next_phase_t = to_tensor(next_phase, squeeze=True) if next_phase is not None else None
 
     # flatten first dimension to use samples from all env
     if "atari" in opt.exp_name:
         obs_t = obs_t.reshape(-1, *obs_t.shape[2:])
+        if next_obs_t is not None:
+            next_obs_t = next_obs_t.reshape(-1, *next_obs_t.shape[2:])
         acs_t = acs_t.reshape(-1, ac_shape)
         dones_t = dones_t.reshape(-1)
+        if phase_t is not None:
+            phase_t = phase_t.reshape(-1)
+        if next_phase_t is not None:
+            next_phase_t = next_phase_t.reshape(-1)
     else:
         obs_t = obs_t.reshape(-1, obs_t.shape[-1])
+        if next_obs_t is not None:
+            next_obs_t = next_obs_t.reshape(-1, next_obs_t.shape[-1])
         acs_t = acs_t.reshape(-1, ac_shape)
         if ac_shape == 1:
             acs_t = acs_t.squeeze(-1)
         dones_t = dones_t.reshape(-1)
+        if phase_t is not None:
+            phase_t = phase_t.reshape(-1)
+        if next_phase_t is not None:
+            next_phase_t = next_phase_t.reshape(-1)
 
-    obs_next_t = torch.cat([obs_t[1:], obs_t[-1:].clone()], dim=0)
+    obs_next_t = next_obs_t
+    if obs_next_t is None:
+        obs_next_t = torch.cat([obs_t[1:], obs_t[-1:].clone()], dim=0)
+    if phase_t is None:
+        phase_t = torch.zeros(obs_t.shape[0], device=device, dtype=torch.get_default_dtype())
+    if next_phase_t is None:
+        next_phase_t = phase_t.clone()
 
     # sample expert_demos
     if isinstance(expert_demos, dict):
         expert_obs_t = to_tensor(expert_demos["obs"])
         expert_acs_t = to_tensor(expert_demos["acs"])
         expert_dones_t = to_tensor(expert_demos["done"])
+        expert_phase_t = (
+            to_tensor(expert_demos["phase"], squeeze=True)
+            if "phase" in expert_demos
+            else torch.zeros(expert_obs_t.shape[0], device=device, dtype=torch.get_default_dtype())
+        )
+        expert_next_phase_t = (
+            to_tensor(expert_demos["next_phase"], squeeze=True)
+            if "next_phase" in expert_demos
+            else expert_phase_t.clone()
+        )
+        expert_obs_next_t = (
+            to_tensor(expert_demos["next_obs"])
+            if "next_obs" in expert_demos
+            else torch.cat([expert_obs_t[1:], expert_obs_t[-1:].clone()], dim=0)
+        )
     else:
         expert_ob_ac_done_reward = expert_demos  # [np.random.randint(0, expert_demos.shape[0], opt.batch_size), :]
         expert_dones_t = to_tensor(expert_ob_ac_done_reward[:, -1])
@@ -594,13 +683,16 @@ def prepare_batch_update_irl(
         expert_ob_ac = expert_ob_ac_done_reward[:, :-2]
         expert_obs_t = to_tensor(expert_ob_ac[:, :-ac_shape])
         expert_acs_t = to_tensor(expert_ob_ac[:, -ac_shape:])
+        expert_obs_next_t = torch.cat(
+            [expert_obs_t[1:], expert_obs_t[-1:].clone()], dim=0
+        )
+        expert_phase_t = torch.zeros(
+            expert_obs_t.shape[0], device=device, dtype=torch.get_default_dtype()
+        )
+        expert_next_phase_t = expert_phase_t.clone()
 
     if ac_shape == 1 and expert_acs_t.dim() > 1 and expert_acs_t.shape[-1] == 1:
         expert_acs_t = expert_acs_t.squeeze(-1)
-
-    expert_obs_next_t = torch.cat(
-        [expert_obs_t[1:], expert_obs_t[-1:].clone()], dim=0
-    )  # repeat last observation
 
     N = expert_obs_t.shape[0]
     T = 1000
@@ -637,6 +729,8 @@ def prepare_batch_update_irl(
     policy_acs_t = acs_t
     policy_obs_next_t = obs_next_t
     policy_dones_t = dones_t
+    policy_phase_t = phase_t
+    policy_next_phase_t = next_phase_t
     all_obs_t = torch.cat([expert_obs_t, obs_t], dim=0)
     all_obs_next_t = torch.cat([expert_obs_next_t, policy_obs_next_t], dim=0)
     if expert_acs_t.shape[-1] == acs_t.shape[-1]:
@@ -651,6 +745,8 @@ def prepare_batch_update_irl(
         all_acs_t = torch.cat([torch.zeros_like(acs_t), acs_t], dim=0)
 
     all_dones_t = torch.cat([expert_dones_t, policy_dones_t], dim=0)
+    all_phase_t = torch.cat([expert_phase_t, policy_phase_t], dim=0)
+    all_next_phase_t = torch.cat([expert_next_phase_t, policy_next_phase_t], dim=0)
 
     update_dict = {}
     update_dict["expert_obs"] = expert_obs_t
@@ -658,12 +754,28 @@ def prepare_batch_update_irl(
     update_dict["expert_acs"] = expert_acs_t
     update_dict["expert_lprobs"] = expert_lprobs_t
     update_dict["expert_dones"] = expert_dones_t
+    update_dict["expert_phase"] = expert_phase_t
+    update_dict["expert_next_phase"] = expert_next_phase_t
 
     if load_support:
         if isinstance(expert_demos, dict):
             support_obs_t = to_tensor(expert_demos["support_obs"])
             support_acs_t = to_tensor(expert_demos["support_acs"])
             support_dones_t = to_tensor(expert_demos["support_done"])
+            support_phase_t = (
+                to_tensor(expert_demos["support_phase"], squeeze=True)
+                if "support_phase" in expert_demos
+                else torch.zeros(
+                    support_obs_t.shape[0],
+                    device=device,
+                    dtype=torch.get_default_dtype(),
+                )
+            )
+            support_next_phase_t = (
+                to_tensor(expert_demos["support_next_phase"], squeeze=True)
+                if "support_next_phase" in expert_demos
+                else support_phase_t.clone()
+            )
             if (
                 ac_shape == 1
                 and support_acs_t.dim() > 1
@@ -679,29 +791,39 @@ def prepare_batch_update_irl(
             support_acs_t = expert_acs_t
             support_dones_t = expert_dones_t
             support_obs_next_t = expert_obs_next_t
+            support_phase_t = expert_phase_t
+            support_next_phase_t = expert_next_phase_t
 
         update_dict["support_obs"] = support_obs_t
         update_dict["support_obs_next"] = support_obs_next_t
         update_dict["support_acs"] = support_acs_t
         update_dict["support_dones"] = support_dones_t
+        update_dict["support_phase"] = support_phase_t
+        update_dict["support_next_phase"] = support_next_phase_t
     else:
         update_dict["support_obs"] = expert_obs_t
         update_dict["support_obs_next"] = expert_obs_next_t
         update_dict["support_acs"] = expert_acs_t
         # update_dict['support_lprobs'] = expert_lprobs_t
         update_dict["support_dones"] = expert_dones_t
+        update_dict["support_phase"] = expert_phase_t
+        update_dict["support_next_phase"] = expert_next_phase_t
 
     update_dict["policy_obs"] = policy_obs_t
     update_dict["policy_obs_next"] = policy_obs_next_t
     update_dict["policy_acs"] = policy_acs_t
     update_dict["policy_lprobs"] = policy_lprobs_t
     update_dict["policy_dones"] = policy_dones_t
+    update_dict["policy_phase"] = policy_phase_t
+    update_dict["policy_next_phase"] = policy_next_phase_t
 
     update_dict["all_obs"] = all_obs_t
     update_dict["all_obs_next"] = all_obs_next_t
     update_dict["all_acs"] = all_acs_t
     update_dict["all_lprobs"] = all_lprobs_t
     update_dict["all_dones"] = all_dones_t
+    update_dict["all_phase"] = all_phase_t
+    update_dict["all_next_phase"] = all_next_phase_t
 
     return update_dict
 

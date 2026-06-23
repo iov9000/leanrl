@@ -22,6 +22,15 @@ from .gsw_utils import GSW
 TensorDict = Mapping[str, torch.Tensor]
 
 
+def _clamp_sorted_neighbor_idx(idx: torch.Tensor, n: int) -> torch.Tensor:
+    """Clamp rank positions so `i` and `i - 1` are both valid neighbors."""
+    if n <= 0:
+        raise ValueError("n must be positive")
+    if n == 1:
+        return idx.clamp(0, 0)
+    return idx.clamp(1, n - 1)
+
+
 def layer_init(
     layer: nn.Module, std: float = np.sqrt(2), bias_const: float = 0.0
 ) -> None:
@@ -364,6 +373,21 @@ class SWILDiscriminator(nn.Module):
         self.i_c = opt.i_c
         self.beta = torch.tensor(opt.min_beta, dtype=torch.float)
         self.alpha_beta = opt.vb_coeff
+        self.mgsw_output_normalize = getattr(opt, "mgsw_output_normalize", False)
+        self.mgsw_use_bounded_alpha = getattr(opt, "mgsw_use_bounded_alpha", False)
+        self.mgsw_alpha_min = getattr(opt, "mgsw_alpha_min", 0.1)
+        self.mgsw_alpha_max = getattr(opt, "mgsw_alpha_max", 5.0)
+        self.mgsw_var_reg_coef = getattr(opt, "mgsw_var_reg_coef", 0.0)
+        self.mgsw_target_std = getattr(opt, "mgsw_target_std", 1.0)
+        self.mgsw_weight_reg_coef = getattr(opt, "mgsw_weight_reg_coef", 0.0)
+        self.mgsw_projection_norm_mode = getattr(
+            opt, "mgsw_projection_norm_mode", "none"
+        )
+        self.mgsw_projection_post_step_max_norm = getattr(
+            opt, "mgsw_projection_post_step_max_norm", 10.0
+        )
+        self.mgsw_eps = 1e-6
+        proj_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.buffer_empty_cnt = 0
 
@@ -475,6 +499,18 @@ class SWILDiscriminator(nn.Module):
         self.expert_acs = torch.randn([opt.batch_size, *ac_shapes])
         self.expert_nobs = torch.randn([opt.batch_size, *ob_shapes])
 
+        self.register_buffer(
+            "running_proj_mean",
+            torch.zeros(self.opt.n_proj, dtype=torch.float32, device=proj_device),
+        )
+        self.register_buffer(
+            "running_proj_std",
+            torch.ones(self.opt.n_proj, dtype=torch.float32, device=proj_device),
+        )
+        self.alpha_raw = nn.Parameter(
+            torch.zeros(self.opt.n_proj, dtype=torch.float32, device=proj_device)
+        )
+
         # self.module_list = nn.ModuleList([self.base, self.base_v, self.reward, self.value])
         # self.d_optimizer = Adam(list(self.base.parameters()) + list(self.reward.parameters()),
         #                lr=self.lr, weight_decay=self.l2_coeff)
@@ -503,9 +539,128 @@ class SWILDiscriminator(nn.Module):
                 opt.use_ll_weight_norm,
                 opt.use_spectral_norm,
             ),
+            torch.nn.Tanh(),
         ]
 
         return layers
+
+    def projection_alpha(self) -> torch.Tensor:
+        if not self.mgsw_use_bounded_alpha:
+            return torch.ones_like(self.alpha_raw)
+        return self.mgsw_alpha_min + (
+            self.mgsw_alpha_max - self.mgsw_alpha_min
+        ) * torch.sigmoid(self.alpha_raw)
+
+    def projection_weight_penalty(self) -> torch.Tensor:
+        penalty = None
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                term = module.weight.pow(2).mean()
+                penalty = term if penalty is None else penalty + term
+        if penalty is None:
+            return self.alpha_raw.new_tensor(0.0)
+        return penalty
+
+    @torch.no_grad()
+    def post_step_projection_clip(self) -> None:
+        if self.mgsw_projection_norm_mode != "post_step_clip":
+            return
+        max_norm = max(self.mgsw_projection_post_step_max_norm, self.mgsw_eps)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                weight = module.weight
+                fro_norm = weight.norm()
+                if fro_norm > max_norm:
+                    weight.mul_(max_norm / (fro_norm + 1e-12))
+
+    def _normalize_projection(
+        self, raw: torch.Tensor, mean: torch.Tensor, std: torch.Tensor
+    ) -> torch.Tensor:
+        if not self.mgsw_output_normalize:
+            return raw
+        return (raw - mean.unsqueeze(0)) / (std.unsqueeze(0) + self.mgsw_eps)
+
+    def _project_raw(
+        self,
+        ob: torch.Tensor,
+        ac: torch.Tensor,
+        nob: torch.Tensor | None = None,
+        d: torch.Tensor | None = None,
+        noise: bool = False,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
+    ]:
+        if self.opt.n_proj > 1 and not self.opt.linear_proj:
+            with torch.no_grad():
+                self.base.apply(layer_init)
+                self.reward.apply(layer_init)
+
+        base_out = self.base_fwd(self.base, ob, ac, nob, d)
+
+        if self.swil_vb > 0:
+            vb_out, z, mu, std = self.vb(base_out, noise=noise)
+        else:
+            vb_out = base_out
+            z = mu = std = None
+
+        if self.opt.proj_layer:
+            raw = self.proj_layer(self.reward(vb_out))
+        else:
+            raw = self.reward(vb_out)
+            if self.opt.n_proj > 1:
+                raw = raw + torch.randn_like(raw) * 0.01
+            if self.opt.add_proj_noise:
+                raw = raw + torch.randn_like(raw) * 0.01
+        return raw, z, mu, std
+
+    def project_pair(
+        self,
+        obs_pi: torch.Tensor,
+        acs_pi: torch.Tensor,
+        nobs_pi: torch.Tensor | None,
+        d_pi: torch.Tensor | None,
+        obs_exp: torch.Tensor,
+        acs_exp: torch.Tensor,
+        nobs_exp: torch.Tensor | None,
+        d_exp: torch.Tensor | None,
+        noise: bool = False,
+        update_running_stats: bool = False,
+    ) -> Dict[str, torch.Tensor | None]:
+        pi_raw, _, p_mu, p_std = self._project_raw(
+            obs_pi, acs_pi, nobs_pi, d_pi, noise=noise
+        )
+        exp_raw, _, e_mu, e_std = self._project_raw(
+            obs_exp, acs_exp, nobs_exp, d_exp, noise=noise
+        )
+
+        union_raw = torch.cat([exp_raw, pi_raw], dim=0)
+        raw_mean = union_raw.mean(dim=0)
+        raw_std = union_raw.std(dim=0, unbiased=False).clamp_min(self.mgsw_eps)
+        if update_running_stats:
+            self.running_proj_mean.copy_(raw_mean.detach())
+            self.running_proj_std.copy_(raw_std.detach())
+
+        pi_norm = self._normalize_projection(pi_raw, raw_mean, raw_std)
+        exp_norm = self._normalize_projection(exp_raw, raw_mean, raw_std)
+        alpha = self.projection_alpha().to(pi_raw)
+        pi_proj = pi_norm * alpha.unsqueeze(0)
+        exp_proj = exp_norm * alpha.unsqueeze(0)
+        proj_union = torch.cat([exp_proj, pi_proj], dim=0)
+
+        return {
+            "pi_proj": pi_proj,
+            "exp_proj": exp_proj,
+            "pi_raw": pi_raw,
+            "exp_raw": exp_raw,
+            "p_mu": p_mu,
+            "p_std": p_std,
+            "e_mu": e_mu,
+            "e_std": e_std,
+            "raw_mean": raw_mean,
+            "raw_std": raw_std,
+            "proj_std": proj_union.std(dim=0, unbiased=False),
+            "alpha": alpha,
+        }
 
     def forward(
         self,
@@ -592,35 +747,12 @@ class SWILDiscriminator(nn.Module):
     ) -> Tuple[
         torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
     ]:
-        if self.opt.n_proj > 1 and not self.opt.linear_proj:
-            with torch.no_grad():
-                self.base.apply(layer_init)
-                self.reward.apply(layer_init)
-
-        base_out = self.base_fwd(self.base, ob, ac, nob, d)
-
-        if self.swil_vb > 0:
-            vb_out, z, mu, std = self.vb(base_out, noise=noise)
-        else:
-            vb_out = base_out
-            z = mu = std = None
-        # rew, v, v_n, d_out = self.forward(ob, next_ob, ac, lprobs) TODO??
-        # potentially use more sophisticated mechanism with multiple projections
-        if self.opt.proj_layer:
-            return self.proj_layer(self.reward(vb_out)), z, mu, std
-        else:
-            # XXX: additional noise?
-            rew = self.reward(vb_out)
-            # rew = rew / (rew.norm(dim=-1, keepdim=True) + 1e-6)
-
-            # perturb with noise -> TODO: sample from stochastic (e.g. Gaussian) process?
-            if self.opt.n_proj > 1:
-                rew += torch.randn_like(rew) * 0.01
-            if self.opt.add_proj_noise:
-                rew += torch.randn_like(rew) * 0.01
-
-            # out = rew/rew.norm(-1)
-            return rew, z, mu, std  # + torch.randn_like(self.reward(base_out))
+        raw, z, mu, std = self._project_raw(ob, ac, nob, d, noise=noise)
+        proj = self._normalize_projection(
+            raw, self.running_proj_mean, self.running_proj_std
+        )
+        proj = proj * self.projection_alpha().to(proj).unsqueeze(0)
+        return proj, z, mu, std
 
     def base_fwd(
         self,
@@ -722,15 +854,10 @@ class SWILDiscriminator(nn.Module):
                         idx = torch.searchsorted(
                             sorted_proj.T, obs_t_slice.T
                         )  # , right=True)
-                        # idx[idx==0] +=1
-                        # idx[idx==n] -=1
+                        idx = _clamp_sorted_neighbor_idx(idx, n)
 
                     idxs = self.pi_atoms_sorted_idx[p]
                     idxs_e = self.exp_atoms_sorted_idx[p]
-
-                    # idx[idx==0] +=1
-                    idx[idx == n] -= 1
-                    # shift extreme indices
 
                     # print("Number of atoms in buffer", n)
                     # calculate weight based on position in queue
@@ -740,6 +867,9 @@ class SWILDiscriminator(nn.Module):
                     # TODO: what if target CDF is left or mixed?
                     if self.opt.aligned_index:
                         i = torch.where(idxs == idx)[0]
+                        if i.numel() == 0:
+                            continue
+                        i = _clamp_sorted_neighbor_idx(i, n)
                         j = 0
                         a_i = (sorted_proj_tgt[i, j] - sorted_proj[i, j]) ** 2
                         a_h = (sorted_proj_tgt[i - 1, j] - sorted_proj[i - 1, j]) ** 2
@@ -1060,9 +1190,20 @@ class SWILDiscriminator(nn.Module):
             self.base.reset()
             self.reward.reset()
 
-        # project slices
-        pi_slices, _, _, _ = self.proj(obs_pi, acs_pi, nobs_pi, d_pi)
-        exp_slices, _, _, _ = self.proj(obs_exp, acs_exp, nobs_exp, d_exp)
+        pair = self.project_pair(
+            obs_pi,
+            acs_pi,
+            nobs_pi,
+            d_pi,
+            obs_exp,
+            acs_exp,
+            nobs_exp,
+            d_exp,
+            noise=False,
+            update_running_stats=True,
+        )
+        pi_slices = pair["pi_proj"]
+        exp_slices = pair["exp_proj"]
 
         # sort slices
         pi_slices_sorted, pi_slices_sorted_idx = torch.sort(
@@ -1261,16 +1402,24 @@ class SWILDiscriminator(nn.Module):
 
         if self.opt.swil_loss == "surr_loss":
             # surrogate loss from maxSWGAN paper
-            policy_out, _, p_mu, p_std = self.proj(
+            pair = self.project_pair(
                 self.policy_obs,
                 self.policy_acs,
                 policy_obs_next,
                 policy_dones,
+                exp_obs,
+                exp_acs,
+                exp_obs_next,
+                exp_dones,
                 noise=True,
+                update_running_stats=True,
             )
-            expert_out, _, e_mu, e_std = self.proj(
-                exp_obs, exp_acs, exp_obs_next, exp_dones, noise=True
-            )
+            policy_out = pair["pi_proj"]
+            expert_out = pair["exp_proj"]
+            p_mu = pair["p_mu"]
+            p_std = pair["p_std"]
+            e_mu = pair["e_mu"]
+            e_std = pair["e_std"]
             # ensure contiguous/cloned to avoid as_strided/inplace issues in autograd
             policy_out = policy_out.contiguous().clone()
             expert_out = expert_out.contiguous().clone()
@@ -1342,6 +1491,31 @@ class SWILDiscriminator(nn.Module):
             d_loss = -gsw_dist + self.proj_norm_coeff * (pi_proj_norm + exp_proj_norm)
             irm_pen = 0
 
+        proj_raw_mean = self.running_proj_mean.mean()
+        proj_raw_std = self.running_proj_std.mean()
+        alpha = self.projection_alpha()
+        effective_std = (
+            alpha if self.mgsw_output_normalize else self.running_proj_std * alpha
+        )
+        proj_eff_std = effective_std.mean()
+        var_reg = self.alpha_raw.new_tensor(0.0)
+        weight_reg = self.alpha_raw.new_tensor(0.0)
+        if self.mgsw_var_reg_coef > 0:
+            target_std = torch.full_like(effective_std, self.mgsw_target_std)
+            var_reg = self.mgsw_var_reg_coef * (
+                (
+                    torch.log(effective_std + self.mgsw_eps)
+                    - torch.log(target_std + self.mgsw_eps)
+                )
+                .pow(2)
+                .mean()
+            )
+        if (
+            self.mgsw_weight_reg_coef > 0
+            and self.mgsw_projection_norm_mode == "weight_penalty"
+        ):
+            weight_reg = self.mgsw_weight_reg_coef * self.projection_weight_penalty()
+
         output_dict = {}
         if self.opt.swil_ae:
             # meaningful reconstruction: action prediction?
@@ -1382,6 +1556,12 @@ class SWILDiscriminator(nn.Module):
         output_dict["ib_loss"] = bottleneck_loss
         output_dict["beta"] = self.beta
         output_dict["lip_penalty"] = lip_penalty
+        output_dict["var_reg"] = var_reg
+        output_dict["weight_reg"] = weight_reg
+        output_dict["proj_raw_mean"] = proj_raw_mean
+        output_dict["proj_raw_std"] = proj_raw_std
+        output_dict["proj_eff_std"] = proj_eff_std
+        output_dict["proj_alpha"] = alpha.mean()
 
         # TODO: classification or reconstruction loss for
 
