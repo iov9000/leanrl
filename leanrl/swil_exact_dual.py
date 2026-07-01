@@ -296,6 +296,7 @@ class LearnedSliceProjector(nn.Module):
 
         self.register_buffer("cal_mean", torch.zeros(num_projections))
         self.register_buffer("cal_std", torch.ones(num_projections))
+        self.register_buffer("cal_inv_std", torch.ones(num_projections))
         self._calibrated = False
         self.eps = 1e-6
 
@@ -317,15 +318,24 @@ class LearnedSliceProjector(nn.Module):
 
     def project(self, x: torch.Tensor) -> torch.Tensor:
         raw = self._raw_project(x)
-        if self._calibrated:
-            return (raw - self.cal_mean) / (self.cal_std + self.eps)
-        return raw
+        return (raw - self.cal_mean) * self.cal_inv_std
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.project(x)
+
+    @torch.no_grad()
+    def reset_calibration(self) -> None:
+        self.cal_mean.zero_()
+        self.cal_std.fill_(1.0)
+        self.cal_inv_std.fill_(1.0)
+        self._calibrated = False
 
     @torch.no_grad()
     def calibrate(self, x: torch.Tensor) -> None:
         raw = self._raw_project(x)
         self.cal_mean.copy_(raw.mean(dim=0))
         self.cal_std.copy_(raw.std(dim=0, unbiased=False).clamp_min(self.eps))
+        self.cal_inv_std.copy_(self.cal_std.add(self.eps).reciprocal())
         self._calibrated = True
 
 
@@ -337,18 +347,19 @@ def maximize_projected_w2(
     n_steps: int = 50,
     lr: float = 1e-3,
     optimizer: torch.optim.Optimizer | None = None,
+    capturable: bool = False,
 ) -> tuple[float, torch.optim.Optimizer]:
     """Solve the Danskin inner problem: maximize projected W₂² over projector ψ.
 
     When optimizer is provided, it is reused (incremental training).
     Returns (w2_value, optimizer) so the caller can persist the optimizer.
     """
-    projector._calibrated = False
+    projector.reset_calibration()
     projector.train()
     if optimizer is None:
-        optimizer = torch.optim.Adam(projector.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(projector.parameters(), lr=lr, capturable=capturable)
 
-    w2_val = 0.0
+    w2_val = torch.zeros((), device=learner_sa.device, dtype=learner_sa.dtype)
     for _ in range(n_steps):
         optimizer.zero_grad()
         z_pol = projector.project(learner_sa)
@@ -373,13 +384,13 @@ def maximize_projected_w2(
 
         (-w2_sq).backward()
         optimizer.step()
-        w2_val = float(w2_sq.detach())
+        w2_val = w2_sq.detach()
 
     projector.eval()
     with torch.no_grad():
         projector.calibrate(torch.cat([learner_sa, expert_sa], dim=0))
 
-    return w2_val, optimizer
+    return float(w2_val.detach().cpu()), optimizer
 
 
 def _orthogonal_rows(
@@ -726,36 +737,36 @@ def build_potential_bank(
             projection_degree=projection_degree,
         )
 
-    z_policy = projector.project(learner_sa)
-    z_expert = projector.project(expert_sa)
-    z_sorted = torch.sort(z_policy, dim=0).values.transpose(0, 1).contiguous()
-    y_sorted = torch.sort(z_expert, dim=0).values.transpose(0, 1).contiguous()
+    policy_atoms = projector.project(learner_sa)
+    expert_atoms = projector.project(expert_sa)
+    policy_sorted = torch.sort(policy_atoms, dim=0).values.transpose(0, 1).contiguous()
+    expert_sorted = torch.sort(expert_atoms, dim=0).values.transpose(0, 1).contiguous()
 
-    n_policy = z_sorted.shape[1]
-    positions = torch.linspace(0.0, 1.0, steps=n_policy, device=z_sorted.device, dtype=z_sorted.dtype)
-    if y_sorted.shape[1] == n_policy:
-        target_grid = y_sorted
+    n_policy = policy_sorted.shape[1]
+    positions = torch.linspace(0.0, 1.0, steps=n_policy, device=policy_sorted.device, dtype=policy_sorted.dtype)
+    if expert_sorted.shape[1] == n_policy:
+        target_grid = expert_sorted
     else:
-        target_grid = _quantile_values(y_sorted, positions)
+        target_grid = _quantile_values(expert_sorted, positions)
 
-    grad = z_sorted - target_grid
-    dz = z_sorted[:, 1:] - z_sorted[:, :-1]
+    grad = policy_sorted - target_grid
+    dz = policy_sorted[:, 1:] - policy_sorted[:, :-1]
     trap = 0.5 * (grad[:, 1:] + grad[:, :-1]) * dz
-    phi = torch.zeros_like(z_sorted)
+    phi = torch.zeros_like(policy_sorted)
     phi[:, 1:] = torch.cumsum(trap, dim=1)
 
-    projected_w2 = 0.5 * (z_sorted - target_grid).pow(2).mean()
+    projected_w2 = 0.5 * (policy_sorted - target_grid).pow(2).mean()
     raw_policy_reward = -phi.mean(dim=0, keepdim=True).transpose(0, 1)
-    raw_expert_reward = -_interp_rows(z_sorted, phi, z_expert).mean(dim=1, keepdim=True)
-    rpl_base_sq = (z_sorted - target_grid).pow(2)
+    raw_expert_reward = -_interp_rows(policy_sorted, phi, expert_atoms).mean(dim=1, keepdim=True)
+    rpl_base_sq = (policy_sorted - target_grid).pow(2)
     rpl_left_delta = torch.zeros_like(rpl_base_sq)
     rpl_right_delta = torch.zeros_like(rpl_base_sq)
-    rpl_left_delta[:, :-1] = (z_sorted[:, 1:] - target_grid[:, :-1]).pow(2) - rpl_base_sq[:, :-1]
-    rpl_right_delta[:, 1:] = (z_sorted[:, :-1] - target_grid[:, 1:]).pow(2) - rpl_base_sq[:, 1:]
-    prefix_pad = torch.zeros(rpl_base_sq.shape[0], 1, device=z_sorted.device, dtype=z_sorted.dtype)
+    rpl_left_delta[:, :-1] = (policy_sorted[:, 1:] - target_grid[:, :-1]).pow(2) - rpl_base_sq[:, :-1]
+    rpl_right_delta[:, 1:] = (policy_sorted[:, :-1] - target_grid[:, 1:]).pow(2) - rpl_base_sq[:, 1:]
+    prefix_pad = torch.zeros(rpl_base_sq.shape[0], 1, device=policy_sorted.device, dtype=policy_sorted.dtype)
     return PotentialBank(
         projector=projector,
-        z_grid=z_sorted,
+        z_grid=policy_sorted,
         target_grid=target_grid,
         phi_grid=phi,
         projected_w2=projected_w2,

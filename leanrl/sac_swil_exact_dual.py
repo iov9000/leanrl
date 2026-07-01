@@ -519,12 +519,12 @@ if __name__ == "__main__":
     q_optimizer = optim.Adam(
         list(qf1.parameters()) + list(qf2.parameters()),
         lr=args.q_lr,
-        capturable=use_cudagraphs and not args.compile,
+        capturable=use_cudagraphs,
     )
     actor_optimizer = optim.Adam(
         list(actor.parameters()),
         lr=args.policy_lr,
-        capturable=use_cudagraphs and not args.compile,
+        capturable=use_cudagraphs,
     )
 
     if args.autotune:
@@ -534,7 +534,7 @@ if __name__ == "__main__":
         a_optimizer = optim.Adam(
             [log_alpha],
             lr=args.q_lr,
-            capturable=use_cudagraphs and not args.compile,
+            capturable=use_cudagraphs,
         )
     else:
         alpha = torch.as_tensor(args.alpha, device=device)
@@ -769,6 +769,7 @@ if __name__ == "__main__":
                     n_steps=args.critic_steps,
                     lr=args.critic_lr,
                     optimizer=critic_optimizer,
+                    capturable=use_cudagraphs,
                 )
                 potential_bank = build_potential_bank(learner_sa, expert_sa, learned_projector)
                 latest_train_logs["critic_w2"] = critic_w2
