@@ -30,6 +30,7 @@ from irl.utils import load_hf_demos, prepare_batch_update_irl
 try:
     from leanrl.il_utils import (
         augment_observations,
+        compute_demo_phases,
         compute_online_phases,
         phase_feature_dim,
         validate_phase_mode,
@@ -37,10 +38,14 @@ try:
 except ImportError:
     from il_utils import (
         augment_observations,
+        compute_demo_phases,
         compute_online_phases,
         phase_feature_dim,
         validate_phase_mode,
     )
+
+BASE_OCCUPANCY_GEOMETRIES = {"s", "sa", "sas", "sasde"}
+OCCUPANCY_GEOMETRIES = BASE_OCCUPANCY_GEOMETRIES | {f"{geometry}t" for geometry in BASE_OCCUPANCY_GEOMETRIES}
 
 
 def prepare_batch_update_irl_gpu(
@@ -172,6 +177,10 @@ class Args:
     n_demos: int = 10
     subsample: int = 1
     normalize_irl_rewards: bool = False
+    occupancy_geometry: str = "sa"
+    """Discriminator occupancy features: s | sa | sas | sasde; append t for sin/cos phase."""
+    absorbing_state: bool = False
+    """Append an absorbing-state indicator to discriminator states and mark terminal next states as absorbing."""
     imitation_phase_mode: str = "none"
     imitation_time_horizon: int = 0
     observation_phase_mode: str = "none"
@@ -210,6 +219,23 @@ class Args:
     # Demo saving (eval)
     save_demo: bool = False
     demo_out: str = ""
+
+
+def validate_occupancy_geometry(value: str) -> str:
+    if value not in OCCUPANCY_GEOMETRIES:
+        raise ValueError(f"Unsupported occupancy_geometry={value}; expected one of {sorted(OCCUPANCY_GEOMETRIES)}")
+    return value
+
+
+def occupancy_base_geometry(value: str) -> str:
+    value = validate_occupancy_geometry(value)
+    if value.endswith("t"):
+        return value[:-1]
+    return value
+
+
+def occupancy_uses_time(value: str) -> bool:
+    return validate_occupancy_geometry(value).endswith("t")
 
 
 def make_env(args, env_id, seed, idx, capture_video, run_name, disc=None):
@@ -305,6 +331,10 @@ class Actor(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    validate_occupancy_geometry(args.occupancy_geometry)
+    occupancy_base = occupancy_base_geometry(args.occupancy_geometry)
+    args.use_actions = occupancy_base in {"sa", "sas", "sasde"}
+    args.use_next_obs = occupancy_base in {"sas", "sasde"}
     validate_phase_mode(args.imitation_phase_mode)
     validate_phase_mode(args.observation_phase_mode)
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{args.compile}__{args.cudagraphs}"
@@ -328,6 +358,10 @@ if __name__ == "__main__":
     # Load expert demos
     demos = load_hf_demos(args, n_demos=args.n_demos)
     demos_all = demos["all"]
+    if occupancy_uses_time(args.occupancy_geometry) and "phase" not in demos_all:
+        phase, next_phase = compute_demo_phases(demos_all["done"], traj_ids=demos_all.get("traj_ids"))
+        demos_all["phase"] = phase.astype(np.float32)
+        demos_all["next_phase"] = next_phase.astype(np.float32)
     # Convert demos to GPU tensors
     for k in ["obs", "acs", "rew", "done", "phase", "next_phase", "next_obs"]:
         if k in demos_all:

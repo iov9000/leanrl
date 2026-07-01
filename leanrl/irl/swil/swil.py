@@ -475,7 +475,7 @@ class SWILDiscriminator(nn.Module):
             )
         else:
             self.gsw_module = GSW(
-                "poly", nofprojections=opt.n_proj, degree=opt.poly_degree
+                opt.gsw_df, nofprojections=opt.n_proj, degree=opt.poly_degree
             )
 
         # init sorted atom queues
@@ -590,11 +590,6 @@ class SWILDiscriminator(nn.Module):
     ) -> Tuple[
         torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
     ]:
-        if self.opt.n_proj > 1 and not self.opt.linear_proj:
-            with torch.no_grad():
-                self.base.apply(layer_init)
-                self.reward.apply(layer_init)
-
         base_out = self.base_fwd(self.base, ob, ac, nob, d)
 
         if self.swil_vb > 0:
@@ -607,8 +602,6 @@ class SWILDiscriminator(nn.Module):
             raw = self.proj_layer(self.reward(vb_out))
         else:
             raw = self.reward(vb_out)
-            if self.opt.n_proj > 1:
-                raw = raw + torch.randn_like(raw) * 0.01
             if self.opt.add_proj_noise:
                 raw = raw + torch.randn_like(raw) * 0.01
         return raw, z, mu, std
@@ -832,7 +825,9 @@ class SWILDiscriminator(nn.Module):
         with torch.no_grad():
             # project next state and rank it as part of previous evaluation
             proj, _, _, _ = self.proj(ob, ac, nob, d)
-            obs_t_slice = proj.unsqueeze(0)
+            if proj.ndim == 1:
+                proj = proj.unsqueeze(0)
+            obs_t_slice = proj
 
             rew = torch.zeros(1, device=obs_t_slice.device)
 
@@ -852,7 +847,7 @@ class SWILDiscriminator(nn.Module):
                         )
                     else:
                         idx = torch.searchsorted(
-                            sorted_proj.T, obs_t_slice.T
+                            sorted_proj.T.contiguous(), obs_t_slice.T.contiguous()
                         )  # , right=True)
                         idx = _clamp_sorted_neighbor_idx(idx, n)
 

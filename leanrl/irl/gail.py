@@ -28,6 +28,47 @@ except ImportError:
     )
 
 TensorDict = Mapping[str, torch.Tensor]
+BASE_OCCUPANCY_GEOMETRIES = {"s", "sa", "sas", "sasde"}
+OCCUPANCY_GEOMETRIES = BASE_OCCUPANCY_GEOMETRIES | {f"{geometry}t" for geometry in BASE_OCCUPANCY_GEOMETRIES}
+
+
+def _occupancy_base_geometry(value: str) -> str:
+    if value not in OCCUPANCY_GEOMETRIES:
+        raise ValueError(f"Unsupported occupancy_geometry={value}; expected one of {sorted(OCCUPANCY_GEOMETRIES)}")
+    if value.endswith("t"):
+        return value[:-1]
+    return value
+
+
+def _occupancy_uses_time(value: str | None) -> bool:
+    return value is not None and value.endswith("t")
+
+
+def _encode_occupancy_phase(phase: torch.Tensor, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    if phase.ndim == 1:
+        phase = phase.unsqueeze(-1)
+    phase = phase.to(device=device, dtype=dtype)
+    angle = phase * (2.0 * torch.pi)
+    return torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1)
+
+
+def _augment_absorbing_state(
+    observations: torch.Tensor,
+    dones: torch.Tensor | None = None,
+    *,
+    next_state: bool = False,
+) -> torch.Tensor:
+    if observations.ndim != 2:
+        raise ValueError(f"observations must be 2D, got {tuple(observations.shape)}")
+    indicator = torch.zeros(observations.shape[0], 1, device=observations.device, dtype=observations.dtype)
+    values = observations
+    if next_state and dones is not None:
+        done_mask = dones.to(device=observations.device, dtype=torch.bool).reshape(-1, 1)
+        if done_mask.shape[0] != observations.shape[0]:
+            raise ValueError(f"dones must have length {observations.shape[0]}, got {done_mask.shape[0]}")
+        values = torch.where(done_mask, torch.zeros_like(observations), observations)
+        indicator = done_mask.to(dtype=observations.dtype)
+    return torch.cat([values, indicator], dim=1)
 
 
 def _resolve_phase_horizon(opt: Namespace, env: gym.Env | None = None) -> int:
@@ -70,9 +111,27 @@ class GAILDiscriminator(nn.Module):
         self.args = args
         self.layer_dims = args.d_layer_dims
         self.lr = args.disc_lr
-        self.use_actions = getattr(args, "use_actions", True)
+        self.occupancy_geometry = getattr(args, "occupancy_geometry", None)
+        if self.occupancy_geometry is not None and self.occupancy_geometry not in OCCUPANCY_GEOMETRIES:
+            raise ValueError(
+                f"Unsupported occupancy_geometry={self.occupancy_geometry}; expected one of {sorted(OCCUPANCY_GEOMETRIES)}"
+            )
+        self.occupancy_base_geometry = (
+            _occupancy_base_geometry(self.occupancy_geometry) if self.occupancy_geometry is not None else None
+        )
+        self.occupancy_uses_time = _occupancy_uses_time(self.occupancy_geometry)
+        self.absorbing_state = bool(getattr(args, "absorbing_state", False))
+        self.use_actions = (
+            self.occupancy_base_geometry in {"sa", "sas", "sasde"}
+            if self.occupancy_geometry is not None
+            else getattr(args, "use_actions", True)
+        )
         self.use_dones = getattr(args, "use_dones", False)
-        self.use_next_obs = getattr(args, "use_next_obs", False)
+        self.use_next_obs = (
+            self.occupancy_base_geometry in {"sas", "sasde"}
+            if self.occupancy_geometry is not None
+            else getattr(args, "use_next_obs", False)
+        )
         self.phase_mode = validate_phase_mode(getattr(args, "imitation_phase_mode", "none"))
         self.phase_dim = phase_feature_dim(self.phase_mode)
         self.irm_coeff = args.irm_coeff
@@ -109,16 +168,19 @@ class GAILDiscriminator(nn.Module):
         if not ac_shapes:
             ac_shapes = [1]
 
-        dim0 = ob_shapes[-1]
+        state_dim = ob_shapes[-1] + (1 if self.absorbing_state else 0)
+        dim0 = state_dim
         if self.use_actions:
             dim0 = dim0 + ac_shapes[-1]
         if self.use_dones:
             dim0 = dim0 + 1
         if self.use_next_obs:
-            dim0 = dim0 + ob_shapes[-1]
+            dim0 = dim0 + state_dim
         dim0 = dim0 + self.phase_dim
         if self.use_next_obs:
             dim0 = dim0 + self.phase_dim
+        if self.occupancy_uses_time:
+            dim0 = dim0 + 2
 
         self.layer_dims = [dim0] + self.layer_dims
         
@@ -180,6 +242,12 @@ class GAILDiscriminator(nn.Module):
                 ac = torch.unsqueeze(ac, -1)
         if d is not None and len(ob.shape) != len(d.shape):
             d = torch.unsqueeze(d, -1)
+        if self.absorbing_state:
+            ob = _augment_absorbing_state(ob)
+            if nob is not None:
+                nob = _augment_absorbing_state(nob, d, next_state=True)
+        if self.occupancy_base_geometry == "sasde" and nob is not None:
+            nob = nob - ob
 
         input_ = [ob]
         phase_features = encode_phase_features(phase, self.phase_mode)
@@ -193,6 +261,10 @@ class GAILDiscriminator(nn.Module):
             input_.append(d)
         if phase_features is not None:
             input_.append(phase_features)
+        if self.occupancy_uses_time:
+            if phase is None:
+                raise ValueError(f"phase must be provided for occupancy_geometry={self.occupancy_geometry}")
+            input_.append(_encode_occupancy_phase(phase, device=ob.device, dtype=ob.dtype))
 
         base_out = self.base(torch.cat(input_, axis=-1))
 
@@ -303,6 +375,9 @@ class GAILDiscriminator(nn.Module):
         interp_obs.requires_grad = True  # For gradient calculation
         
         input_ = [interp_obs]
+        interp_acs = None
+        interp_next_obs = None
+        interp_d = None
         if self.use_actions:
             acs_epsilon = torch.rand(policy_acs.shape, device=policy_acs.device)
             interp_acs = acs_epsilon * policy_acs + (1 - acs_epsilon) * exp_acs
@@ -317,14 +392,21 @@ class GAILDiscriminator(nn.Module):
             interp_next_phase = 0.5 * (policy_next_phase + exp_next_phase)
         else:
             interp_next_phase = None
-        if self.use_dones:
+        if self.use_dones or (self.absorbing_state and self.use_next_obs):
             d_epsilon = torch.rand(policy_dones.shape, device=policy_dones.device)
             interp_d = d_epsilon * policy_dones + (1 - d_epsilon) * exp_dones
             interp_d.requires_grad = True  # For gradient calculation
             input_.append(interp_d)
         interp_phase = 0.5 * (policy_phase + exp_phase)
 
-        estimate = self.forward(*input_, phase=interp_phase, next_phase=interp_next_phase)
+        estimate = self.forward(
+            interp_obs,
+            interp_acs,
+            interp_next_obs,
+            interp_d,
+            phase=interp_phase,
+            next_phase=interp_next_phase,
+        )
 
         grads = torch.autograd.grad(estimate.sum(), input_, create_graph=True)
         # Combine gradients from all inputs before computing the penalty
@@ -425,6 +507,7 @@ class GailReward(gym.Wrapper):
         self.phase_mode = validate_phase_mode(
             getattr(self.args, "imitation_phase_mode", "none")
         )
+        self.occupancy_uses_time = _occupancy_uses_time(getattr(self.args, "occupancy_geometry", None))
         self.phase_horizon = _resolve_phase_horizon(self.args, env)
         self.obs = None
         self.step_index = 0
@@ -448,7 +531,7 @@ class GailReward(gym.Wrapper):
         done_t = torch.tensor([done], dtype=torch.float32, device=next(self.discriminator.parameters()).device).unsqueeze(0)
         phase_t = None
         next_phase_t = None
-        if self.phase_mode != "none":
+        if self.phase_mode != "none" or self.occupancy_uses_time:
             phase_t, next_phase_t = compute_online_phases(
                 torch.tensor(
                     [self.step_index],

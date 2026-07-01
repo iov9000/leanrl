@@ -116,6 +116,8 @@ def compute_swd(
     return reg_weight * w_dist.mean()
 
 class GSW:
+    VALID_FTYPES = {"linear", "poly", "circular", "index"}
+
     def __init__(
         self,
         ftype: str = "poly",
@@ -124,6 +126,8 @@ class GSW:
         radius: float = 2.0,
         use_cuda: bool = False,
     ) -> None:
+        if ftype not in self.VALID_FTYPES:
+            raise ValueError(f"Unsupported GSW ftype={ftype}; expected one of {sorted(self.VALID_FTYPES)}")
         self.ftype = ftype
         self.nofprojections = nofprojections
         self.degree = degree
@@ -256,6 +260,10 @@ class GSW:
             theta = torch.stack(
                 [self.radius * th / torch.sqrt((th**2).sum()) for th in theta]
             )
+        elif self.ftype == "index":
+            theta = torch.randint(0, dim, (self.nofprojections,))
+        else:
+            raise ValueError(f"Unsupported GSW ftype={self.ftype}; expected one of {sorted(self.VALID_FTYPES)}")
         return theta.to(self.device)
 
     def random_data_index(self, X: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:

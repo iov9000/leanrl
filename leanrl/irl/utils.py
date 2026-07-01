@@ -464,9 +464,10 @@ def demos_gen_dict(
     if batch_size <= 0:
         return
 
-    b_inds = torch.arange(len(data["obs"]), device=data["obs"].device, dtype=torch.long)
+    device = data["obs"].device if isinstance(data["obs"], torch.Tensor) else "cpu"
+    b_inds = torch.arange(len(data["obs"]), device=device, dtype=torch.long)
     if shuffle:
-        b_inds = torch.randperm(len(data["obs"]), device=data["obs"].device)
+        b_inds = torch.randperm(len(data["obs"]), device=device)
 
     for i in range(0, len(data["obs"]), batch_size):
         end = i + batch_size

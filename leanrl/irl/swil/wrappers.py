@@ -223,7 +223,9 @@ class SwilIRDiffReward(gym.Wrapper):
                 n = len(sorted_proj)
 
                 # idx = torch.searchsorted(sorted_proj.T.contiguous(), obs_t_slice.T.contiguous())#, right=True)
-                idx = torch.searchsorted(sorted_proj.T, obs_t_slice.T)  # , right=True)
+                idx = torch.searchsorted(
+                    sorted_proj.T.contiguous(), obs_t_slice.T.contiguous()
+                )  # , right=True)
 
                 # shift extreme indices
                 idx[idx == 0] += 1
