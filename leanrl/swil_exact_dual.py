@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import pickle
 from dataclasses import dataclass
@@ -173,6 +174,87 @@ def sample_unit_projections(
     return theta.to(device=device)
 
 
+class ErfActivation(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.erf(x)
+
+
+class FixedSliceMLP(nn.Module):
+    """Frozen two-hidden-layer slice network matching the SAC MLP layout."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        activation: str = "relu",
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.activation = activation
+        self.eps = eps
+        fc1 = nn.Linear(self.input_dim, self.hidden_dim)
+        fc2 = nn.Linear(self.hidden_dim, self.hidden_dim)
+        fc3 = nn.Linear(self.hidden_dim, self.output_dim)
+        self.net = nn.Sequential(
+            fc1,
+            self._activation_module(),
+            fc2,
+            self._activation_module(),
+            fc3,
+        )
+        self.register_buffer("cal_mean", torch.zeros(self.output_dim))
+        self.register_buffer("cal_std", torch.ones(self.output_dim))
+        self.register_buffer("cal_inv_std", torch.ones(self.output_dim))
+        self._calibrated = False
+        self.requires_grad_(False)
+
+    @property
+    def calibrated(self) -> bool:
+        return self._calibrated
+
+    @property
+    def fc1(self) -> nn.Linear:
+        return self.net[0]
+
+    @property
+    def fc2(self) -> nn.Linear:
+        return self.net[2]
+
+    @property
+    def fc3(self) -> nn.Linear:
+        return self.net[4]
+
+    def _activation_module(self) -> nn.Module:
+        if self.activation == "relu":
+            return nn.ReLU()
+        if self.activation == "silu":
+            return nn.SiLU()
+        if self.activation == "tanh":
+            return nn.Tanh()
+        if self.activation == "erf":
+            return ErfActivation()
+        raise ValueError(f"Unsupported nn_activation={self.activation}")
+
+    def raw_project(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raw = self.raw_project(x)
+        return (raw - self.cal_mean) * self.cal_inv_std
+
+    @torch.no_grad()
+    def calibrate(self, x: torch.Tensor) -> None:
+        raw = self.raw_project(x)
+        self.cal_mean.copy_(raw.mean(dim=0))
+        self.cal_std.copy_(raw.std(dim=0, unbiased=False).clamp_min(self.eps))
+        self.cal_inv_std.copy_(self.cal_std.add(self.eps).reciprocal())
+        self._calibrated = True
+
+
 @dataclass
 class SliceProjector:
     projection_type: str
@@ -180,42 +262,33 @@ class SliceProjector:
     num_projections: int
     directions: torch.Tensor | None = None
     projection_degree: int = 2
-    nn_w1: torch.Tensor | None = None
-    nn_b1: torch.Tensor | None = None
-    nn_readouts: torch.Tensor | None = None
+    nn_projector: FixedSliceMLP | None = None
     nn_activation: str = "silu"
     nn_linear_count: int = 0
-    nn_slice_mean: torch.Tensor | None = None
-    nn_slice_std: torch.Tensor | None = None
     eps: float = 1e-6
 
     @property
     def needs_calibration(self) -> bool:
-        return self.projection_type in {"nn_random", "mixed_linear_nn"} and self.nn_slice_mean is None
-
-    def _nn_features(self, x: torch.Tensor) -> torch.Tensor:
-        if self.nn_w1 is None or self.nn_b1 is None:
-            raise RuntimeError("NN slice projector is missing frozen trunk parameters")
-        h = x @ self.nn_w1.transpose(0, 1) + self.nn_b1
-        if self.nn_activation == "relu":
-            h = torch.relu(h)
-        elif self.nn_activation == "silu":
-            h = torch.nn.functional.silu(h)
-        elif self.nn_activation == "tanh":
-            h = torch.tanh(h)
-        elif self.nn_activation == "erf":
-            h = torch.erf(h)
-        else:
-            raise ValueError(f"Unsupported nn_activation={self.nn_activation}")
-        return h / (float(h.shape[1]) ** 0.5)
+        return self.projection_type in {"nn_random", "mixed_linear_nn"} and (
+            self.nn_projector is None or not self.nn_projector.calibrated
+        )
 
     def _nn_project(self, x: torch.Tensor) -> torch.Tensor:
-        if self.nn_readouts is None:
-            raise RuntimeError("NN slice projector is missing frozen readouts")
-        raw = self._nn_features(x) @ self.nn_readouts.transpose(0, 1)
-        if self.nn_slice_mean is not None and self.nn_slice_std is not None:
-            raw = (raw - self.nn_slice_mean.to(raw)) / self.nn_slice_std.to(raw).clamp_min(self.eps)
-        return raw
+        if self.nn_projector is None:
+            raise RuntimeError("NN slice projector is missing frozen MLP")
+        return self.nn_projector(x)
+
+    @property
+    def nn_w1(self) -> torch.Tensor | None:
+        return None if self.nn_projector is None else self.nn_projector.fc1.weight
+
+    @property
+    def nn_b1(self) -> torch.Tensor | None:
+        return None if self.nn_projector is None else self.nn_projector.fc1.bias
+
+    @property
+    def nn_readouts(self) -> torch.Tensor | None:
+        return None if self.nn_projector is None else self.nn_projector.fc3.weight
 
     def project(self, x: torch.Tensor) -> torch.Tensor:
         if self.projection_type in {"linear_random", "poly_random", "circular_random"}:
@@ -245,20 +318,19 @@ class SliceProjector:
     def with_calibration(self, calibration_x: torch.Tensor) -> "SliceProjector":
         if self.projection_type not in {"nn_random", "mixed_linear_nn"}:
             return self
-        raw = self._nn_project(calibration_x)
+        nn_projector = None
+        if self.nn_projector is not None:
+            nn_projector = copy.deepcopy(self.nn_projector)
+            nn_projector.calibrate(calibration_x)
         return SliceProjector(
             projection_type=self.projection_type,
             input_dim=self.input_dim,
             num_projections=self.num_projections,
             directions=self.directions,
             projection_degree=self.projection_degree,
-            nn_w1=self.nn_w1,
-            nn_b1=self.nn_b1,
-            nn_readouts=self.nn_readouts,
+            nn_projector=nn_projector,
             nn_activation=self.nn_activation,
             nn_linear_count=self.nn_linear_count,
-            nn_slice_mean=raw.mean(dim=0),
-            nn_slice_std=raw.std(dim=0, unbiased=False).clamp_min(self.eps),
             eps=self.eps,
         )
 
@@ -393,23 +465,6 @@ def maximize_projected_w2(
     return float(w2_val.detach().cpu()), optimizer
 
 
-def _orthogonal_rows(
-    num_rows: int,
-    dim: int,
-    gen: torch.Generator,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    rows = []
-    remaining = num_rows
-    while remaining > 0:
-        block = min(remaining, dim)
-        mat = torch.randn(dim, dim, generator=gen, dtype=dtype)
-        q, _ = torch.linalg.qr(mat)
-        rows.append(q[:block])
-        remaining -= block
-    return torch.cat(rows, dim=0)
-
-
 def sample_slice_projector(
     input_dim: int,
     num_projections: int,
@@ -454,8 +509,6 @@ def sample_slice_projector(
             projection_degree=projection_degree,
         )
 
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(seed)
     if projection_type == "mixed_linear_nn":
         if nn_linear_count <= 0:
             nn_linear_count = num_projections // 2
@@ -475,18 +528,22 @@ def sample_slice_projector(
             dtype=dtype,
         )
 
-    nn_w1 = torch.randn(nn_feature_dim, input_dim, generator=gen, dtype=dtype) / (float(input_dim) ** 0.5)
-    nn_b1 = torch.randn(nn_feature_dim, generator=gen, dtype=dtype) * 0.01
-    nn_readouts = _orthogonal_rows(nn_count, nn_feature_dim, gen, dtype)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        nn_projector = FixedSliceMLP(
+            input_dim=input_dim,
+            hidden_dim=nn_feature_dim,
+            output_dim=nn_count,
+            activation=nn_activation,
+        )
+    nn_projector = nn_projector.to(device=device, dtype=dtype)
     return SliceProjector(
         projection_type=projection_type,
         input_dim=input_dim,
         num_projections=num_projections,
         directions=directions,
         projection_degree=projection_degree,
-        nn_w1=nn_w1.to(device=device),
-        nn_b1=nn_b1.to(device=device),
-        nn_readouts=nn_readouts.to(device=device),
+        nn_projector=nn_projector,
         nn_activation=nn_activation,
         nn_linear_count=nn_linear_count,
     )
