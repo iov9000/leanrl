@@ -174,6 +174,43 @@ def sample_unit_projections(
     return theta.to(device=device)
 
 
+def sample_random_path_projections(
+    learner_sa: torch.Tensor,
+    expert_sa: torch.Tensor,
+    num_projections: int,
+    *,
+    kappa: float = 0.0,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    if learner_sa.ndim != 2 or expert_sa.ndim != 2:
+        raise ValueError("learner_sa and expert_sa must be 2D")
+    if learner_sa.shape[1] != expert_sa.shape[1]:
+        raise ValueError("learner_sa and expert_sa feature dimensions must match")
+    if learner_sa.device != expert_sa.device:
+        raise ValueError("learner_sa and expert_sa must be on the same device")
+    if learner_sa.shape[0] <= 0 or expert_sa.shape[0] <= 0:
+        raise ValueError("Need non-empty learner and expert samples")
+    if num_projections <= 0:
+        raise ValueError(f"num_projections must be positive, got {num_projections}")
+    if kappa < 0.0:
+        raise ValueError(f"kappa must be nonnegative, got {kappa}")
+
+    learner_idx = torch.randint(learner_sa.shape[0], (num_projections,), device=learner_sa.device)
+    expert_idx = torch.randint(expert_sa.shape[0], (num_projections,), device=learner_sa.device)
+    directions = learner_sa[learner_idx] - expert_sa[expert_idx.to(device=expert_sa.device)]
+    norm = directions.norm(dim=1, keepdim=True)
+
+    fallback = torch.randn_like(directions)
+    fallback = fallback / fallback.norm(dim=1, keepdim=True).clamp_min(eps)
+    directions = torch.where(norm > eps, directions / norm.clamp_min(eps), fallback)
+
+    if kappa > 0.0:
+        # Lightweight vMF-like proposal: perturb the path direction and renormalize.
+        directions = directions + torch.randn_like(directions) / (kappa**0.5)
+        directions = directions / directions.norm(dim=1, keepdim=True).clamp_min(eps)
+    return directions
+
+
 class ErfActivation(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.erf(x)

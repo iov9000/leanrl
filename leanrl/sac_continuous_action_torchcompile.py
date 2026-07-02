@@ -69,6 +69,8 @@ class Args:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
+    normalized_action_entropy: bool = False
+    """Use tanh-normalized action coordinates for SAC entropy, omitting the env action-scale log-Jacobian constant."""
 
     compile: bool = False
     """whether to use torch.compile."""
@@ -131,8 +133,9 @@ LOG_STD_MIN = -5
 
 
 class Actor(nn.Module):
-    def __init__(self, env, n_obs, n_act, device=None):
+    def __init__(self, env, n_obs, n_act, device=None, include_action_scale_in_log_prob: bool = True):
         super().__init__()
+        self.include_action_scale_in_log_prob = include_action_scale_in_log_prob
         self.fc1 = nn.Linear(n_obs, 256, device=device)
         self.fc2 = nn.Linear(256, 256, device=device)
         self.fc_mean = nn.Linear(256, n_act, device=device)
@@ -176,7 +179,10 @@ class Actor(nn.Module):
         action = y_t * self.action_scale + self.action_bias
         log_prob = normal.log_prob(x_t)
         # Enforcing Action Bound
-        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
+        tanh_jacobian = 1 - y_t.pow(2)
+        if self.include_action_scale_in_log_prob:
+            tanh_jacobian = self.action_scale * tanh_jacobian
+        log_prob -= torch.log(tanh_jacobian + 1e-6)
         log_prob = log_prob.sum(1, keepdim=True)
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return action, log_prob, mean
@@ -213,8 +219,21 @@ if __name__ == "__main__":
 
     max_action = float(envs.single_action_space.high[0])
 
-    actor = Actor(envs, device=device, n_act=n_act, n_obs=n_obs)
-    actor_detach = Actor(envs, device=device, n_act=n_act, n_obs=n_obs)
+    include_action_scale_in_log_prob = not args.normalized_action_entropy
+    actor = Actor(
+        envs,
+        device=device,
+        n_act=n_act,
+        n_obs=n_obs,
+        include_action_scale_in_log_prob=include_action_scale_in_log_prob,
+    )
+    actor_detach = Actor(
+        envs,
+        device=device,
+        n_act=n_act,
+        n_obs=n_obs,
+        include_action_scale_in_log_prob=include_action_scale_in_log_prob,
+    )
     # Copy params to actor_detach without grad
     from_module(actor).data.to_module(actor_detach)
     policy = TensorDictModule(
@@ -251,7 +270,10 @@ if __name__ == "__main__":
         target_entropy = -torch.prod(
             torch.Tensor(envs.single_action_space.shape).to(device)
         ).item()
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        if args.alpha <= 0:
+            raise ValueError(f"--alpha must be positive when --autotune is enabled, got {args.alpha}")
+        log_alpha = torch.log(torch.as_tensor([args.alpha], device=device))
+        log_alpha.requires_grad_()
         alpha = log_alpha.detach().exp()
         a_optimizer = optim.Adam(
             [log_alpha], lr=args.q_lr, capturable=args.cudagraphs and not args.compile

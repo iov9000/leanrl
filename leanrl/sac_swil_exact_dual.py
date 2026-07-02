@@ -1,6 +1,7 @@
 # docs and experiment results for the SAC substrate:
 # https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import csv
+import copy
 import os
 import random
 import time
@@ -39,6 +40,7 @@ try:
         load_expert_dataset,
         maximize_projected_w2,
         normalized_swil_rewards,
+        sample_random_path_projections,
         sample_slice_projector,
         state_action_samples,
     )
@@ -52,6 +54,7 @@ except ImportError:
         load_expert_dataset,
         maximize_projected_w2,
         normalized_swil_rewards,
+        sample_random_path_projections,
         sample_slice_projector,
         state_action_samples,
     )
@@ -83,6 +86,8 @@ class Args:
     target_network_frequency: int = 1
     alpha: float = 0.2
     autotune: bool = True
+    normalized_action_entropy: bool = False
+    """Use tanh-normalized action coordinates for SAC entropy, omitting the env action-scale log-Jacobian constant."""
     measure_burnin: int = 3
     compile: bool = False
     cudagraphs: bool = False
@@ -103,6 +108,16 @@ class Args:
     """linear_random | poly_random | circular_random | nn_random | mixed_linear_nn"""
     projection_degree: int = 2
     projection_radius: float = 2.0
+    random_path_bank: bool = False
+    """Use a mixed bank with fixed uniform linear directions plus random-path directions."""
+    random_path_num_projections: int = 0
+    """Number of random-path directions; if 0, use half of --num-projections."""
+    random_path_refresh_freq: int = 1000
+    """Minimum environment steps between random-path direction refreshes."""
+    random_path_replace_count: int = 512
+    """Number of path directions to replace per refresh; if <=0, replace all path directions."""
+    random_path_kappa: float = 0.0
+    """vMF-like concentration around path directions; 0 uses exact normalized paths."""
     nn_slice_features: int = 256
     nn_slice_activation: str = "silu"  # relu | silu | tanh | erf
     nn_slice_linear_count: int = 0
@@ -124,6 +139,28 @@ class Args:
     swil_num_learner_samples: int = 8192
     swil_num_expert_samples: int = 8192
     swil_warmup_steps: int = 5000
+    swil_event_triggered_update: bool = False
+    """Use reward-drift/noise triggered potential-bank refreshes instead of fixed-step refreshes."""
+    swil_event_check_freq: int = 10
+    """Environment-step interval for candidate-bank checks when event-triggered refresh is enabled."""
+    swil_event_reward_drift_threshold: float = 0.1
+    """Install a candidate bank when normalized reward drift exceeds this and SAC is ready."""
+    swil_event_z_threshold: float = 2.0
+    """Require reward drift to exceed this multiple of split-half bank-estimation noise."""
+    swil_event_hard_reward_drift_threshold: float = 0.5
+    """Install immediately when normalized reward drift exceeds this stale-bank threshold."""
+    swil_event_min_critic_updates: int = 0
+    """If >0, fixed minimum critic updates between event-triggered installs."""
+    swil_event_min_target_taus: float = 0.5
+    """If min critic updates is 0, use this many target-network time constants: c_Q / tau."""
+    swil_event_q_drift_threshold: float = 0.1
+    """SAC tracking gate on target-Q drift; set <=0 to disable this gate."""
+    swil_event_probe_samples: int = 512
+    """Replay occupancy samples used to compare current and candidate rewards."""
+    swil_event_q_probe_samples: int = 512
+    """Replay transition samples used to monitor target-Q drift since the last bank install."""
+    swil_event_noise_floor_min: float = 1e-3
+    """Lower bound for split-half bank noise when computing the staleness Z score."""
 
     # Checkpointing / evaluation
     save_dir: str = "checkpoints"
@@ -293,8 +330,9 @@ LOG_STD_MIN = -5
 
 
 class Actor(nn.Module):
-    def __init__(self, env):
+    def __init__(self, env, include_action_scale_in_log_prob: bool = True):
         super().__init__()
+        self.include_action_scale_in_log_prob = include_action_scale_in_log_prob
         obs_dim = int(np.array(env.single_observation_space.shape).prod())
         act_dim = int(np.prod(env.single_action_space.shape))
         self.fc1 = nn.Linear(obs_dim, 256)
@@ -330,7 +368,10 @@ class Actor(nn.Module):
         y_t = torch.tanh(x_t)
         action = y_t * self.action_scale + self.action_bias
         log_prob = normal.log_prob(x_t)
-        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
+        tanh_jacobian = 1 - y_t.pow(2)
+        if self.include_action_scale_in_log_prob:
+            tanh_jacobian = self.action_scale * tanh_jacobian
+        log_prob -= torch.log(tanh_jacobian + 1e-6)
         log_prob = log_prob.sum(1, keepdim=True)
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return action, log_prob, mean
@@ -432,6 +473,15 @@ def open_csv_logger(path: str, run_name: str):
             "projected_w2",
             "fw_duality_gap",
             "proxy_fw_gap",
+            "swil_event_reward_drift",
+            "swil_event_noise",
+            "swil_event_z",
+            "swil_event_q_drift",
+            "swil_event_critic_updates",
+            "swil_event_installed",
+            "swil_event_hard",
+            "random_path_refreshed",
+            "random_path_count",
             "critic_w2",
             "q_loss",
             "policy_loss",
@@ -454,8 +504,38 @@ if __name__ == "__main__":
         raise ValueError("--expert_path is required for exact-dual SWIL")
     if args.potential_interp != "linear":
         raise ValueError("--potential_interp currently only supports linear")
+    if args.autotune and args.alpha <= 0:
+        raise ValueError(f"--alpha must be positive when --autotune is enabled, got {args.alpha}")
     validate_occupancy_geometry(args.occupancy_geometry)
     reward_kwargs = swil_reward_kwargs(args)
+    if args.swil_event_triggered_update:
+        if args.learned_projections:
+            raise ValueError("--swil-event-triggered-update currently supports fixed projections only")
+        if args.swil_event_check_freq <= 0:
+            raise ValueError("--swil-event-check-freq must be positive")
+        if args.swil_event_probe_samples < 2:
+            raise ValueError("--swil-event-probe-samples must be at least 2")
+        if args.swil_event_q_probe_samples <= 0:
+            raise ValueError("--swil-event-q-probe-samples must be positive")
+        if args.swil_event_noise_floor_min <= 0:
+            raise ValueError("--swil-event-noise-floor-min must be positive")
+    random_path_count = 0
+    uniform_projection_count = args.num_projections
+    if args.random_path_bank:
+        if args.learned_projections:
+            raise ValueError("--random-path-bank currently supports fixed projections only")
+        if args.projection_type != "linear_random":
+            raise ValueError("--random-path-bank requires --projection-type linear_random")
+        if args.num_projections < 2:
+            raise ValueError("--random-path-bank requires at least two total projections")
+        if args.random_path_refresh_freq <= 0:
+            raise ValueError("--random-path-refresh-freq must be positive")
+        if args.random_path_kappa < 0.0:
+            raise ValueError("--random-path-kappa must be nonnegative")
+        random_path_count = args.random_path_num_projections or max(1, args.num_projections // 2)
+        if random_path_count <= 0 or random_path_count >= args.num_projections:
+            raise ValueError("--random-path-num-projections must be in [1, --num-projections - 1]")
+        uniform_projection_count = args.num_projections - random_path_count
 
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}"
     if args.track:
@@ -502,14 +582,10 @@ if __name__ == "__main__":
         args.absorbing_state,
     )
 
-    print(expert_sa_raw.shape)
-
-    print(args.normalize_sa)
-
     envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
-    actor = Actor(envs).to(device)
+    actor = Actor(envs, include_action_scale_in_log_prob=not args.normalized_action_entropy).to(device)
     qf1 = SoftQNetwork(envs).to(device)
     qf2 = SoftQNetwork(envs).to(device)
     qf1_target = SoftQNetwork(envs).to(device)
@@ -529,7 +605,8 @@ if __name__ == "__main__":
 
     if args.autotune:
         target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        log_alpha = torch.log(torch.as_tensor([args.alpha], device=device))
+        log_alpha.requires_grad_()
         alpha = log_alpha.detach().exp()
         a_optimizer = optim.Adam(
             [log_alpha],
@@ -552,7 +629,7 @@ if __name__ == "__main__":
     sa_dim = expert_sa_raw.shape[1]
     slice_projector = sample_slice_projector(
         sa_dim,
-        args.num_projections,
+        uniform_projection_count,
         seed=args.projection_seed,
         projection_type=args.projection_type,
         projection_degree=args.projection_degree,
@@ -562,6 +639,11 @@ if __name__ == "__main__":
         nn_linear_count=args.nn_slice_linear_count,
         device=device,
     )
+    random_path_uniform_directions = None
+    if args.random_path_bank:
+        if slice_projector.directions is None:
+            raise RuntimeError("random path bank expected linear directions")
+        random_path_uniform_directions = slice_projector.directions.clone()
     learned_projector: LearnedSliceProjector | None = None
     if args.learned_projections:
         learned_projector = LearnedSliceProjector(
@@ -586,6 +668,19 @@ if __name__ == "__main__":
 
     potential_bank: PotentialBank | None = None
     last_swil_update = -args.swil_update_freq
+    last_swil_event_check = -args.swil_event_check_freq
+    critic_updates_since_swil_refresh = 0
+    event_min_critic_updates = (
+        args.swil_event_min_critic_updates
+        if args.swil_event_min_critic_updates > 0
+        else max(1, int(np.ceil(args.swil_event_min_target_taus / max(args.tau, 1e-12))))
+    )
+    q_probe_state: dict[str, object] = {"data": None, "baseline": None}
+    random_path_state: dict[str, object] = {
+        "directions": None,
+        "last_update": -args.random_path_refresh_freq,
+        "refreshed": 0.0,
+    }
     critic_w2 = 0.0
     critic_optimizer: torch.optim.Optimizer | None = None
 
@@ -593,6 +688,116 @@ if __name__ == "__main__":
         if args.autotune:
             return log_alpha.detach().exp()
         return alpha
+
+    def target_q_probe_values(data) -> torch.Tensor:
+        q1 = qf1_target(data.observations, data.actions)
+        q2 = qf2_target(data.observations, data.actions)
+        return torch.min(q1, q2).flatten().detach()
+
+    def refresh_q_probe_baseline() -> None:
+        if replay_size(rb) <= 0:
+            q_probe_state["data"] = None
+            q_probe_state["baseline"] = None
+            return
+        q_probe_data, _ = sample_replay_batch_with_indices(rb, args.swil_event_q_probe_samples)
+        q_probe_state["data"] = q_probe_data
+        q_probe_state["baseline"] = target_q_probe_values(q_probe_data)
+
+    def target_q_drift() -> float:
+        q_probe_data = q_probe_state["data"]
+        q_probe_baseline = q_probe_state["baseline"]
+        if q_probe_data is None or q_probe_baseline is None:
+            return 0.0
+        assert isinstance(q_probe_baseline, torch.Tensor)
+        current = target_q_probe_values(q_probe_data)
+        denom = q_probe_baseline.std(unbiased=False).clamp_min(1e-6)
+        return float(torch.sqrt((current - q_probe_baseline).pow(2).mean()).div(denom).item())
+
+    def reward_drift(current_bank: PotentialBank, candidate_bank: PotentialBank, probe_sa: torch.Tensor) -> float:
+        current_reward = normalized_swil_rewards(
+            current_bank,
+            probe_sa,
+            reward_scale=args.swil_reward_scale,
+            **reward_kwargs,
+        )
+        candidate_reward = normalized_swil_rewards(
+            candidate_bank,
+            probe_sa,
+            reward_scale=args.swil_reward_scale,
+            **reward_kwargs,
+        )
+        denom = current_reward.std(unbiased=False).clamp_min(1e-6)
+        return float(torch.sqrt((candidate_reward - current_reward).pow(2).mean()).div(denom).item())
+
+    def propose_random_path_directions(
+        learner_sa: torch.Tensor,
+        expert_sa: torch.Tensor,
+        global_step: int,
+        *,
+        force: bool = False,
+    ) -> tuple[torch.Tensor | None, bool]:
+        if not args.random_path_bank:
+            return None, False
+        if random_path_uniform_directions is None or slice_projector.directions is None:
+            raise RuntimeError("random path bank requires fixed uniform directions")
+        path_directions = random_path_state["directions"]
+        due = (
+            force
+            or path_directions is None
+            or global_step - int(random_path_state["last_update"]) >= args.random_path_refresh_freq
+        )
+        random_path_state["refreshed"] = 0.0
+        if not due:
+            assert isinstance(path_directions, torch.Tensor)
+            return path_directions, False
+
+        replace_count = random_path_count
+        if path_directions is not None and args.random_path_replace_count > 0:
+            replace_count = min(args.random_path_replace_count, random_path_count)
+        new_directions = sample_random_path_projections(
+            learner_sa,
+            expert_sa,
+            replace_count,
+            kappa=args.random_path_kappa,
+        )
+        if path_directions is None or replace_count >= random_path_count:
+            path_directions = new_directions
+        else:
+            assert isinstance(path_directions, torch.Tensor)
+            path_directions = path_directions.clone()
+            replace_idx = torch.randperm(random_path_count, device=learner_sa.device)[:replace_count]
+            path_directions[replace_idx] = new_directions
+        return path_directions, True
+
+    def mixed_random_path_projector(path_directions: torch.Tensor):
+        if random_path_uniform_directions is None:
+            raise RuntimeError("random path bank requires fixed uniform directions")
+        projector = copy.deepcopy(slice_projector)
+        projector.directions = torch.cat([random_path_uniform_directions, path_directions], dim=0)
+        projector.num_projections = int(projector.directions.shape[0])
+        return projector
+
+    def commit_random_path_directions(path_directions: torch.Tensor | None, global_step: int, refreshed: bool) -> None:
+        if not args.random_path_bank:
+            return
+        if path_directions is None:
+            raise RuntimeError("random path bank cannot commit missing path directions")
+        random_path_state["directions"] = path_directions
+        if refreshed:
+            random_path_state["last_update"] = global_step
+            random_path_state["refreshed"] = 1.0
+        else:
+            random_path_state["refreshed"] = 0.0
+
+    def debug_potential_bank_update(global_step: int, bank: PotentialBank, reason: str) -> None:
+        tqdm.tqdm.write(
+            "[swil] potential_bank updated "
+            f"step={global_step} "
+            f"reason={reason} "
+            f"num_projections={bank.z_grid.shape[0]} "
+            f"num_atoms={bank.z_grid.shape[1]} "
+            f"projected_w2={float(bank.projected_w2.item()):.6g}"
+        )
 
     def update_critic(data: TensorDict) -> TensorDict:
         q_optimizer.zero_grad()
@@ -696,6 +901,7 @@ if __name__ == "__main__":
     desc = ""
     measure_burnin = 0
     latest_train_logs: dict[str, float] = {}
+    latest_event_logs: dict[str, float] = {}
 
     for global_step in pbar:
         if global_step == args.measure_burnin + max(args.learning_starts, args.swil_warmup_steps):
@@ -733,12 +939,14 @@ if __name__ == "__main__":
         obs = next_obs
         episode_steps = torch.where(done_mask, torch.zeros_like(episode_steps), episode_steps + 1.0)
 
-        can_update_swil = (
-            global_step >= args.swil_warmup_steps
-            and replay_size(rb) >= 2
-            and (potential_bank is None or global_step - last_swil_update >= args.swil_update_freq)
-        )
+        if args.swil_event_triggered_update:
+            swil_refresh_due = potential_bank is None or global_step - last_swil_event_check >= args.swil_event_check_freq
+        else:
+            swil_refresh_due = potential_bank is None or global_step - last_swil_update >= args.swil_update_freq
+        can_update_swil = global_step >= args.swil_warmup_steps and replay_size(rb) >= 2 and swil_refresh_due
         if can_update_swil:
+            if args.swil_event_triggered_update:
+                last_swil_event_check = global_step
             learner_sa_raw = sample_replay_sa(
                 rb,
                 args.swil_num_learner_samples,
@@ -772,11 +980,92 @@ if __name__ == "__main__":
                     capturable=use_cudagraphs,
                 )
                 potential_bank = build_potential_bank(learner_sa, expert_sa, learned_projector)
+                debug_potential_bank_update(global_step, potential_bank, "learned_projection_refresh")
                 latest_train_logs["critic_w2"] = critic_w2
             else:
-                potential_bank = build_potential_bank(learner_sa, expert_sa, slice_projector)
+                path_directions, path_refreshed = propose_random_path_directions(
+                    learner_sa,
+                    expert_sa,
+                    global_step,
+                    force=potential_bank is None,
+                )
+                candidate_projector = (
+                    mixed_random_path_projector(path_directions)
+                    if args.random_path_bank and path_directions is not None
+                    else slice_projector
+                )
+                candidate_bank = build_potential_bank(learner_sa, expert_sa, candidate_projector)
+                if not args.swil_event_triggered_update:
+                    potential_bank = candidate_bank
+                    last_swil_update = global_step
+                    commit_random_path_directions(path_directions, global_step, path_refreshed)
+                    debug_potential_bank_update(global_step, potential_bank, "fixed_interval_refresh")
+                elif potential_bank is None:
+                    potential_bank = candidate_bank
+                    last_swil_update = global_step
+                    critic_updates_since_swil_refresh = 0
+                    commit_random_path_directions(path_directions, global_step, path_refreshed)
+                    refresh_q_probe_baseline()
+                    debug_potential_bank_update(global_step, potential_bank, "event_initial_refresh")
+                    latest_event_logs = {
+                        "train/swil_event_reward_drift": 0.0,
+                        "train/swil_event_noise": 0.0,
+                        "train/swil_event_z": 0.0,
+                        "train/swil_event_q_drift": 0.0,
+                        "train/swil_event_critic_updates": float(critic_updates_since_swil_refresh),
+                        "train/swil_event_installed": 1.0 if args.swil_event_triggered_update else 0.0,
+                        "train/swil_event_hard": 0.0,
+                    }
+                else:
+                    probe_sa = normalizer.transform(
+                        sample_replay_sa(
+                            rb,
+                            args.swil_event_probe_samples,
+                            device,
+                            recent=True,
+                            occupancy_geometry=args.occupancy_geometry,
+                            phase_buffer=replay_phase,
+                            absorbing_state=args.absorbing_state,
+                        )
+                    )
+                    event_reward_drift = reward_drift(potential_bank, candidate_bank, probe_sa)
+                    event_noise = 0.0
+                    half = learner_sa.shape[0] // 2
+                    if half >= 2:
+                        split_idx = torch.randperm(learner_sa.shape[0], device=learner_sa.device)[: 2 * half]
+                        bank_half_1 = build_potential_bank(learner_sa[split_idx[:half]], expert_sa, slice_projector)
+                        bank_half_2 = build_potential_bank(learner_sa[split_idx[half:]], expert_sa, slice_projector)
+                        event_noise = reward_drift(bank_half_1, bank_half_2, probe_sa)
+                    event_z = event_reward_drift / max(event_noise, args.swil_event_noise_floor_min)
+                    event_q_drift = target_q_drift()
+                    sac_ready = critic_updates_since_swil_refresh >= event_min_critic_updates
+                    if args.swil_event_q_drift_threshold > 0:
+                        sac_ready = sac_ready and event_q_drift <= args.swil_event_q_drift_threshold
+                    event_hard = event_reward_drift >= args.swil_event_hard_reward_drift_threshold
+                    event_install = event_hard or (
+                        event_reward_drift >= args.swil_event_reward_drift_threshold
+                        and event_z >= args.swil_event_z_threshold
+                        and sac_ready
+                    )
+                    if event_install:
+                        potential_bank = candidate_bank
+                        last_swil_update = global_step
+                        critic_updates_since_swil_refresh = 0
+                        commit_random_path_directions(path_directions, global_step, path_refreshed)
+                        refresh_q_probe_baseline()
+                        debug_potential_bank_update(global_step, potential_bank, "event_triggered_refresh")
+                    latest_event_logs = {
+                        "train/swil_event_reward_drift": event_reward_drift,
+                        "train/swil_event_noise": event_noise,
+                        "train/swil_event_z": event_z,
+                        "train/swil_event_q_drift": event_q_drift,
+                        "train/swil_event_critic_updates": float(critic_updates_since_swil_refresh),
+                        "train/swil_event_installed": 1.0 if event_install else 0.0,
+                        "train/swil_event_hard": 1.0 if event_hard else 0.0,
+                    }
 
-            last_swil_update = global_step
+            if args.learned_projections:
+                last_swil_update = global_step
 
         if global_step > args.learning_starts and potential_bank is not None and normalizer is not None:
             data, batch_indices = sample_replay_batch_with_indices(rb, args.batch_size)
@@ -828,6 +1117,7 @@ if __name__ == "__main__":
                 device=device,
             )
             out_main = update_critic(update_batch)
+            critic_updates_since_swil_refresh += 1
             actor_loss_value = 0.0
             if global_step % args.policy_frequency == 0:
                 for _ in range(args.policy_frequency):
@@ -878,6 +1168,15 @@ if __name__ == "__main__":
                     "train/q_loss": float(out_main["q_loss"].item()),
                     "train/policy_loss": actor_loss_value,
                     "train/alpha": float(current_alpha().item()),
+                    **latest_event_logs,
+                    **(
+                        {
+                            "train/random_path_refreshed": float(random_path_state["refreshed"]),
+                            "train/random_path_count": float(random_path_count),
+                        }
+                        if args.random_path_bank
+                        else {}
+                    ),
                     **({"train/critic_w2": critic_w2} if args.learned_projections else {}),
                 }
 
@@ -918,6 +1217,15 @@ if __name__ == "__main__":
                     "projected_w2": latest_train_logs.get("train/projected_w2", ""),
                     "fw_duality_gap": latest_train_logs.get("train/fw_duality_gap", ""),
                     "proxy_fw_gap": latest_train_logs.get("train/proxy_fw_gap", ""),
+                    "swil_event_reward_drift": latest_train_logs.get("train/swil_event_reward_drift", ""),
+                    "swil_event_noise": latest_train_logs.get("train/swil_event_noise", ""),
+                    "swil_event_z": latest_train_logs.get("train/swil_event_z", ""),
+                    "swil_event_q_drift": latest_train_logs.get("train/swil_event_q_drift", ""),
+                    "swil_event_critic_updates": latest_train_logs.get("train/swil_event_critic_updates", ""),
+                    "swil_event_installed": latest_train_logs.get("train/swil_event_installed", ""),
+                    "swil_event_hard": latest_train_logs.get("train/swil_event_hard", ""),
+                    "random_path_refreshed": latest_train_logs.get("train/random_path_refreshed", ""),
+                    "random_path_count": latest_train_logs.get("train/random_path_count", ""),
                     "critic_w2": latest_train_logs.get("train/critic_w2", ""),
                     "q_loss": latest_train_logs.get("train/q_loss", ""),
                     "policy_loss": latest_train_logs.get("train/policy_loss", ""),
